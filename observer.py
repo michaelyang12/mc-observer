@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import math
 import os
 import queue
 import random
@@ -41,6 +42,16 @@ OPEN_KINDS = {"grudge", "favor", "promise"}
 OPEN_CAP = 5
 OPEN_MAX_AGE = 30 * 86400
 FACT_CAP = 15
+MEMORY_BUDGET = 2200
+CATCHUP_BUDGET = 600
+MEMORIES_PER_PLAYER = 4
+MEMORY_HALF_WEIGHT_DAYS = 7
+MATCH_BOOST = 2
+RECENT_LOG = 12
+MEMORY_HEADER = "MEMORY (a selection picked for this moment; you remember much more than is shown):"
+STOPWORDS = set("""about after again also been before being could does doing done from have just know like make
+more much only over really said should some than that them then there these they thing this those very want
+were what when where which while will with would your yeah okay lmao haha game""".split())
 ACTION_IMPORTANCE = {"smite": 4, "take": 4, "give": 3, "world": 3}
 
 FRIENDLY_MOBS = {"chicken", "pig", "cow", "sheep", "rabbit", "frog", "goat", "fox", "llama", "parrot", "cat"}
@@ -99,6 +110,20 @@ every event, update opinions of the players involved according to YOUR persona's
 is defined in the persona, e.g. respect, wealth, bravery, poverty, deaths). Deltas -15..+15 (most events
 -5..+5; save double digits for big moments) with a short note when something meaningful happened. Let opinion shape tone, generosity, and punishment: favorites
 get warmth and gifts, players you dislike get mockery, curses, and mobs.
+
+Memory:
+- The MEMORY section is a selection chosen for this moment; you remember far more. Never say you've forgotten
+  something or that it didn't happen just because it isn't shown.
+- Opinions, impressions, nicknames and memories shown are yours alone. "Since you were last active" lists neutral
+  facts from while another character ran the server: react to them through YOUR values, not theirs.
+- "memory": save meaning, not play-by-play; the server log already records every event. Most replies save
+  nothing. At most 2 per reply, text <=150 chars. kind: moment (something that happened), grudge (a wrong you
+  hold against them), favor (a debt either way), promise (someone committed to do something), joke (a running
+  gag). players: everyone it's about; [] for your own experience not about any player.
+- importance 1..10: 1 trivia, 4 notable, 7 a story you'd retell, 10 a defining moment ("betrayed a friend",
+  "killed the dragon"). Most memories are 3-6.
+- "fact": lasting facts about a player (where their base is, pet's name, main project, rival). key is a short
+  lowercase label, value <=100 chars; a new value replaces the old one. At most 2 per reply.
 
 What you see about players (health, food, dimension, wealth summary, gear, deaths, kills, full inventory
 for players who just spoke) is background knowledge. Use it to judge players and to be accurate, but do NOT
@@ -354,6 +379,39 @@ CREATE TABLE IF NOT EXISTS cooldowns (key TEXT PRIMARY KEY, last_used REAL NOT N
 """
 
 
+def stamp(t: float, date_only: bool = False) -> str:
+    if date_only:
+        return time.strftime("%m-%d", time.localtime(t))
+    same_day = time.strftime("%m-%d", time.localtime(t)) == time.strftime("%m-%d")
+    return time.strftime("%H:%M" if same_day else "%m-%d %H:%M", time.localtime(t))
+
+
+def keywords(text: str, skip) -> list[str]:
+    skip = {w for s in skip for w in re.findall(r"[a-z0-9]+", s.lower())}
+    words = []
+    for w in re.findall(r"[a-z]{4,}", text.lower()):
+        if w not in STOPWORDS and w not in skip and w not in words:
+            words.append(w)
+    return words[:12]
+
+
+def with_others(m: sqlite3.Row, player: str) -> str:
+    also = [w for w in (m["who"] or "").split(",") if w and w != player]
+    return f", with {', '.join(also)}" if also else ""
+
+
+def fts_query(words: list[str]) -> str:
+    return " OR ".join(f'"{w}"' for w in words)
+
+
+def action_detail(detail: str | None) -> str:
+    try:
+        d = json.loads(detail or "{}")
+    except json.JSONDecodeError:
+        return ""
+    return " ".join(f"{v}" for v in d.values() if v not in (None, ""))
+
+
 def classify(body: str, names) -> tuple[str, str | None, int]:
     if m := CHAT.match(body):
         return "chat", m.group(1), 1
@@ -457,11 +515,6 @@ class Memory:
         return self.x("INSERT INTO events (t, kind, player, persona, text, importance, dim) VALUES (?, ?, ?, ?, ?, ?, ?)",
                       (time.time(), kind, player, persona, text, importance, dim))
 
-    def recent_lines(self, n: int, before_id: int | None = None) -> list[str]:
-        rows = self.q("SELECT text FROM (SELECT id, text FROM events WHERE kind != 'bot_action' AND id < ? "
-                      "ORDER BY id DESC LIMIT ?) ORDER BY id", (before_id or 2**62, n))
-        return [r["text"] for r in rows]
-
     def last_used(self, key: str) -> float:
         row = self.one("SELECT last_used FROM cooldowns WHERE key = ?", (key,))
         return row["last_used"] if row else 0.0
@@ -559,6 +612,126 @@ class Memory:
                        (player, key, value, time.time(), source))
             db.execute("DELETE FROM facts WHERE player = ? AND key NOT IN "
                        "(SELECT key FROM facts WHERE player = ? ORDER BY updated_at DESC LIMIT ?)", (player, player, FACT_CAP))
+
+    def last_call(self, persona: str) -> float | None:
+        row = self.one("SELECT value FROM meta WHERE key = ?", (f"last_call:{persona}",))
+        return float(row["value"]) if row else None
+
+    def set_last_call(self, persona: str) -> None:
+        self.x("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (f"last_call:{persona}", str(time.time())))
+
+    def recent(self, n: int, before_id: int) -> list[sqlite3.Row]:
+        return self.q("SELECT * FROM (SELECT * FROM events WHERE id < ? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                      (before_id, n))
+
+    def ranked_memories(self, persona: str, players: list[str] | None, words: list[str]) -> list[sqlite3.Row]:
+        if players:
+            marks = ",".join("?" * len(players))
+            rows = self.q(f"SELECT m.*, (SELECT group_concat(player) FROM memory_players WHERE memory_id = m.id) AS who "
+                          f"FROM memories m WHERE m.persona = ? AND COALESCE(m.status, '') != 'open' AND m.id IN "
+                          f"(SELECT memory_id FROM memory_players WHERE player IN ({marks}))", (persona, *players))
+        else:
+            rows = self.q("SELECT m.*, NULL AS who FROM memories m WHERE m.persona = ? "
+                          "AND m.id NOT IN (SELECT memory_id FROM memory_players)", (persona,))
+        matched = set()
+        if words and rows:
+            matched = {r[0] for r in self.q("SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?", (fts_query(words),))}
+        now = time.time()
+        return sorted(rows, key=lambda r: -(r["importance"] / math.sqrt(1 + (now - r["t"]) / 86400 / MEMORY_HALF_WEIGHT_DAYS)
+                                             + (MATCH_BOOST if r["id"] in matched else 0)))
+
+    def recalled(self, ids) -> None:
+        with self.tx() as db:
+            for mid in ids:
+                db.execute("UPDATE memories SET last_recalled_at = ?, recall_count = recall_count + 1 WHERE id = ?",
+                           (time.time(), mid))
+
+    def context(self, persona: str, players: list[str], words: list[str], before_id: int) -> str:
+        items: list[tuple[str, str, int | None]] = []
+        catchup: list[str] = []
+        since = self.last_call(persona)
+        others = self.one("SELECT 1 FROM events WHERE t > ? AND persona NOT IN (?, 'legacy') LIMIT 1",
+                          (since or 0, persona))
+        if others:
+            start = since or time.time() - 3 * 86400
+            rows = [(r["left_at"], f"{r['player']}'s session: {r['summary']}") for r in self.q(
+                "SELECT * FROM sessions WHERE left_at > ? AND summary IS NOT NULL", (start,))]
+            rows += [(r["t"], r["text"]) for r in self.q(
+                "SELECT * FROM events WHERE t > ? AND id < ? AND importance >= 3 ORDER BY t DESC LIMIT 40", (start, before_id))]
+            used = 0
+            for t, text in sorted(rows, key=lambda r: -r[0]):
+                line = f"{stamp(t)} {text}"
+                if used + len(line) + 3 <= CATCHUP_BUDGET:
+                    catchup.append(line)
+                    used += len(line) + 3
+        items += [("catchup", line, None) for line in catchup]
+
+        rels = {p: self.relationship(persona, p) for p in players}
+        for p in players:
+            r = rels[p]
+            notes = "; ".join(f"{n['delta']:+d} {n['note']}" for n in self.opinion_notes(persona, p, 2))
+            line = f"your opinion {r['opinion']:+d}, familiarity {r['familiarity']}"
+            line += f', you call them "{r["nickname"]}"' if r["nickname"] else ""
+            items.append((p, line + (f"; recent: {notes}" if notes else ""), None))
+        shown: set[int] = set()
+        for p in players:
+            for m in self.q("SELECT m.*, (SELECT group_concat(player) FROM memory_players WHERE memory_id = m.id) AS who "
+                            "FROM memories m JOIN memory_players mp ON mp.memory_id = m.id WHERE m.persona = ? "
+                            "AND mp.player = ? AND m.status = 'open' ORDER BY m.importance DESC, m.t DESC", (persona, p)):
+                if m["id"] not in shown:
+                    shown.add(m["id"])
+                    items.append((p, f"open {m['kind']}: {m['text']} ({stamp(m['t'], True)}{with_others(m, p)}, "
+                                     f"importance {m['importance']})", m["id"]))
+        for p in players:
+            if rels[p]["impression"]:
+                items.append((p, f"impression: {rels[p]['impression']}", None))
+        for p in players:
+            for m in [m for m in self.ranked_memories(persona, [p], words) if m["id"] not in shown][:MEMORIES_PER_PLAYER]:
+                shown.add(m["id"])
+                items.append((p, f"{m['kind']}: {m['text']} ({stamp(m['t'], True)}{with_others(m, p)})", m["id"]))
+        for m in self.ranked_memories(persona, None, words)[:2]:
+            items.append(("self", f"{m['kind']}: {m['text']} ({stamp(m['t'], True)})", m["id"]))
+        for p in players:
+            for f in self.q("SELECT * FROM facts WHERE player = ? ORDER BY updated_at DESC", (p,)):
+                items.append((p, f"fact: {f['key']} = {f['value']}", None))
+        if words:
+            for p in players:
+                for e in self.q("SELECT e.* FROM events_fts JOIN events e ON e.id = events_fts.rowid WHERE events_fts MATCH ? "
+                                "AND e.player = ? AND e.importance >= 2 AND e.id < ? ORDER BY bm25(events_fts) LIMIT 2",
+                                (fts_query(words), p, before_id)):
+                    items.append((p, f"past: {stamp(e['t'], True)} {e['text']}", None))
+        for p in players:
+            s = self.one("SELECT * FROM sessions WHERE player = ? AND summary IS NOT NULL ORDER BY joined_at DESC LIMIT 1", (p,))
+            if s:
+                items.append((p, f"last session ({stamp(s['joined_at'], True)}): {s['summary']}", None))
+        for p in players:
+            acts = self.q("SELECT * FROM actions WHERE player = ? AND t > ? ORDER BY t DESC LIMIT 3", (p, time.time() - 7 * 86400))
+            if acts:
+                desc = "; ".join(f"{stamp(a['t'])} {a['persona']} {a['kind']} {action_detail(a['detail'])}".rstrip() for a in acts)
+                items.append((p, f"recent actions toward them: {desc}", None))
+
+        headers = {"catchup": "Since you were last active (neutral facts; judge them by your own values):",
+                   "self": "Your own experiences:"}
+        groups: dict[str, list[str]] = {}
+        recalled = []
+        used = len(MEMORY_HEADER) + 1
+        for group, text, mid in items:
+            cost = len(text) + 3 + (0 if group in groups else len(headers.get(group, f"About {group} (private to you):")) + 1)
+            if used + cost > MEMORY_BUDGET:
+                continue
+            used += cost
+            groups.setdefault(group, []).append(text)
+            if mid:
+                recalled.append(mid)
+        self.recalled(recalled)
+        if not groups:
+            return ""
+        out = [MEMORY_HEADER]
+        for group in ["catchup", *players, "self"]:
+            if group in groups:
+                out.append(headers.get(group, f"About {group} (private to you):"))
+                out += [f"- {t}" for t in groups[group]]
+        return "\n".join(out)
 
     def opinion_notes(self, persona: str, player: str, n: int) -> list[sqlite3.Row]:
         return self.q("SELECT * FROM (SELECT * FROM opinion_changes WHERE persona = ? AND player = ? "
@@ -681,18 +854,14 @@ class Observer:
                 return True
         return random.random() < p["chattiness"]
 
-    def player_block(self, player: str, detailed: bool, slug: str) -> str:
-        rel = self.mem.relationship(slug, player)
-        notes = [f"{time.strftime('%m-%d', time.localtime(n['t']))} {n['note']} ({n['delta']:+d})"
-                 for n in self.mem.opinion_notes(slug, player, 5)]
+    def player_block(self, player: str, detailed: bool) -> str:
         v = self.vitals.get(player) or {}
         scores = rcon(f"scoreboard players list {player}")
         stats = dict(re.findall(r"\[(obs_\w+)\]: (\d+)", scores)) or dict(
             (k, v2) for v2, k in re.findall(r"(\d+) \((obs_\w+)\)", scores))
         totals, worn = read_inventory(player)
         lines = [
-            f"{player}: opinion {rel['opinion']:+d} | notes: {'; '.join(notes) or 'none yet'}",
-            f"  health {v.get('health', '?')}/20, food {v.get('food', '?')}/20, {v.get('dim', '?')}, y={v.get('y', '?')} | "
+            f"{player}: health {v.get('health', '?')}/20, food {v.get('food', '?')}/20, {v.get('dim', '?')}, y={v.get('y', '?')} | "
             f"deaths {stats.get('obs_deaths', 0)}, mob kills {stats.get('obs_kills', 0)}, player kills {stats.get('obs_pvp', 0)}",
             f"  {wealth_summary(totals, worn)}",
             f"  diamond budget left this hour: {DIAMOND_CAP_PER_HOUR - self.diamonds_last_hour(player)}",
@@ -705,15 +874,27 @@ class Observer:
     def handle(self, batch: list[str]) -> None:
         self.last_event = time.time()
         p = persona()
+        ids = []
         for body in batch:
             if "joined the game" in body or "left the game" in body:
                 self.refresh_online()
-            self.record(body, p["slug"])
+            ids.append(self.record(body, p["slug"]))
         if not self.online or not self.worth_model_call(batch, p):
             return
+        prompt, speakers, involved = self.build_prompt(batch, p, min(ids))
+        self.mem.touch(p["slug"], involved)
+        self.mem.set_last_call(p["slug"])
+        t0 = time.time()
+        action = self.ask_model(p, prompt)
+        log(f"model {time.time() - t0:.1f}s -> {action}")
+        if action:
+            self.execute(action, speakers)
+
+    def build_prompt(self, batch: list[str], p: dict, first_id: int) -> tuple[str, set[str], list[str]]:
         speakers = {m.group(1) for b in batch if (m := CHAT.match(b))}
-        involved = {n for b in batch for n in self.online if n in b} or set(self.online)
-        others = sorted(self.online - involved)
+        found = {n for b in batch for n in self.online if n in b} or set(self.online)
+        involved = sorted(found & speakers) + sorted(found - speakers)
+        others = sorted(self.online - found)
         avail = {
             "smite": self.ready("smite", SMITE_COOLDOWN),
             "creeper": self.ready("creeper", CREEPER_COOLDOWN),
@@ -723,7 +904,11 @@ class Observer:
             "title": self.ready("title", TITLE_COOLDOWN),
         }
         world_job = self.pool.submit(rcon, "time")
-        block_jobs = [self.pool.submit(self.player_block, n, n in speakers, p['slug']) for n in sorted(involved)]
+        block_jobs = [self.pool.submit(self.player_block, n, n in speakers) for n in involved]
+        recent = self.mem.recent(RECENT_LOG, first_id)
+        before = recent[0]["id"] if recent else first_id
+        words = keywords(" ".join(batch), [*self.online, p["name"]])
+        memory = self.mem.context(p["slug"], involved, words, before)
         blocks = [j.result() for j in block_jobs]
         world_time = (world_job.result().splitlines() or ["time unknown"])[0]
         prompt = (
@@ -732,15 +917,11 @@ class Observer:
             f"Actions available now: {', '.join(k for k, ok in avail.items() if ok) or 'only say/give/take/potion/effect'}\n\n"
             "Players involved:\n" + "\n".join(blocks) + "\n" +
             "".join(f"Other online: {n}: opinion {self.mem.relationship(p['slug'], n)['opinion']:+d}\n" for n in others) +
-            "\nRecent server log (oldest first, your own lines included):\n" + "\n".join(self.mem.recent_lines(25)) +
+            (f"\n{memory}\n" if memory else "") +
+            "\nRecent server log (oldest first, your own lines included):\n" + "\n".join(r["text"] for r in recent) +
             "\n\nNEW (react to these, or stay silent):\n" + "\n".join(batch)
         )
-        self.mem.touch(p["slug"], involved)
-        t0 = time.time()
-        action = self.ask_model(p, prompt)
-        log(f"model {time.time() - t0:.1f}s -> {action}")
-        if action:
-            self.execute(action, speakers)
+        return prompt, speakers, involved
 
     def ask_model(self, p: dict, prompt: str) -> dict | None:
         system = f"You speak in Minecraft chat on a server of adult friends.\n\n{p['body']}\n\n{RULES}"
