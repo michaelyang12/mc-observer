@@ -74,7 +74,7 @@ chattiness: 0.3                  <- odds of reacting to chat not aimed at it (0-
 Voice. "What you value:" (drives opinions). "Powers:" (generosity vs chaos, favored actions).
 ```
 
-Current: `pirate`, `grimbold`, `deborah`, `algorithm`, `rummage` (loves poor players), `mortimer`, `gary`.
+Current: `pirate`, `grimbold`, `deborah`, `algorithm`, `rummage` (loves poor players), `mortimer`, `gary`, `observer` (the normal one), `neil`, `dennis`, `tribunal`.
 Describe tone rather than exact catchphrases: the model parrots example lines. Make "What you value" specific;
 inverted values are what make characters distinct. No sexual content: the chat is shared with other players
 (the user asked once; it was declined).
