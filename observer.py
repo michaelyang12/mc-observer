@@ -6,15 +6,17 @@ import random
 import socket
 import struct
 import re
+import sqlite3
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "state.json"
+MEMORY_DB = HERE / "memory.db"
 PERSONA_FILE = HERE / "persona.md"
 CONTAINER = os.environ.get("OBSERVER_CONTAINER", "minecraft")
 MODEL = os.environ.get("OBSERVER_MODEL", "sonnet")
@@ -242,6 +244,7 @@ def persona() -> dict:
             except ValueError:
                 pass
     p["body"] = "\n".join(lines).strip() or f"You are {p['name']}."
+    p["slug"] = PERSONA_FILE.resolve().stem
     return p
 
 
@@ -286,46 +289,219 @@ def wealth_summary(totals: dict[str, int], worn: list[str]) -> str:
             f"best sword {best_tier(totals, ('_sword',))} | valuables {valuables}")
 
 
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS players (
+    name TEXT PRIMARY KEY, first_seen REAL, last_seen REAL, total_playtime_s REAL NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY, player TEXT NOT NULL, joined_at REAL NOT NULL, left_at REAL, summary TEXT);
+CREATE INDEX IF NOT EXISTS sessions_player ON sessions(player, joined_at);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY, t REAL NOT NULL, kind TEXT NOT NULL, player TEXT, persona TEXT, text TEXT NOT NULL,
+    importance INTEGER NOT NULL DEFAULT 1, dim TEXT);
+CREATE INDEX IF NOT EXISTS events_t ON events(t);
+CREATE INDEX IF NOT EXISTS events_player ON events(player, t);
+CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(text, content='events', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS events_ai AFTER INSERT ON events BEGIN
+    INSERT INTO events_fts(rowid, text) VALUES (new.id, new.text); END;
+CREATE TABLE IF NOT EXISTS facts (
+    player TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at REAL NOT NULL, source TEXT NOT NULL,
+    PRIMARY KEY (player, key));
+CREATE TABLE IF NOT EXISTS relationships (
+    persona TEXT NOT NULL, player TEXT NOT NULL, opinion INTEGER NOT NULL DEFAULT 0,
+    familiarity INTEGER NOT NULL DEFAULT 0, impression TEXT, nickname TEXT, last_interaction REAL,
+    PRIMARY KEY (persona, player));
+CREATE TABLE IF NOT EXISTS opinion_changes (
+    id INTEGER PRIMARY KEY, persona TEXT NOT NULL, player TEXT NOT NULL, t REAL NOT NULL, delta INTEGER NOT NULL,
+    note TEXT);
+CREATE INDEX IF NOT EXISTS opinion_changes_pp ON opinion_changes(persona, player, t);
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY, persona TEXT NOT NULL, t REAL NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+    importance INTEGER NOT NULL, status TEXT, last_recalled_at REAL, recall_count INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS memories_persona ON memories(persona, status);
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(text, content='memories', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text); END;
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, text) VALUES ('delete', old.id, old.text); END;
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF text ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text); END;
+CREATE TABLE IF NOT EXISTS memory_players (memory_id INTEGER NOT NULL, player TEXT NOT NULL,
+    PRIMARY KEY (memory_id, player));
+CREATE INDEX IF NOT EXISTS memory_players_player ON memory_players(player);
+CREATE TABLE IF NOT EXISTS actions (
+    id INTEGER PRIMARY KEY, t REAL NOT NULL, persona TEXT, player TEXT, kind TEXT NOT NULL, detail TEXT,
+    diamonds INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS actions_player ON actions(player, t);
+CREATE TABLE IF NOT EXISTS cooldowns (key TEXT PRIMARY KEY, last_used REAL NOT NULL);
+"""
+
+
+def classify(body: str, names) -> tuple[str, str | None, int]:
+    if m := CHAT.match(body):
+        return "chat", m.group(1), 1
+    if body.startswith("OBSERVED: "):
+        return "observed", next((n for n in sorted(names) if n in body), None), 2
+    if body.startswith("<"):
+        return "bot_say", None, 1
+    first = body.split(" ", 1)[0]
+    player = first if PLAYER.match(first) else None
+    if "joined the game" in body:
+        return "join", player, 1
+    if "left the game" in body:
+        return "leave", player, 1
+    if "has completed the challenge" in body:
+        return "advancement", player, 4
+    if "has made the advancement" in body or "has reached the goal" in body:
+        return "advancement", player, 3
+    return "death", player, 2
+
+
+class Memory:
+    def __init__(self, path: Path = MEMORY_DB) -> None:
+        self.lock = threading.RLock()
+        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.executescript(SCHEMA)
+        if not self.one("SELECT 1 FROM meta WHERE key = 'imported_state'"):
+            self.import_state(STATE_FILE)
+
+    def q(self, sql: str, args=()) -> list[sqlite3.Row]:
+        with self.lock:
+            return self.db.execute(sql, args).fetchall()
+
+    def one(self, sql: str, args=()) -> sqlite3.Row | None:
+        rows = self.q(sql, args)
+        return rows[0] if rows else None
+
+    def x(self, sql: str, args=()) -> int:
+        with self.lock:
+            return self.db.execute(sql, args).lastrowid
+
+    @contextmanager
+    def tx(self):
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.db
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def import_state(self, path: Path) -> None:
+        try:
+            state = json.loads(path.read_text())
+        except Exception:
+            state = {}
+        now = time.time()
+        year = time.localtime(now).tm_year
+        with self.tx() as db:
+            for name, prof in (state.get("players") or {}).items():
+                if not PLAYER.match(name):
+                    continue
+                times = [now]
+                for note in prof.get("notes", []):
+                    m = re.match(r"^(\d\d)-(\d\d) (.*?)(?: \([+-]?\d+\))?$", str(note))
+                    t, text = now, str(note)
+                    if m:
+                        t = time.mktime((year, int(m.group(1)), int(m.group(2)), 0, 0, 0, 0, 0, -1))
+                        t = t if t <= now else time.mktime((year - 1, int(m.group(1)), int(m.group(2)), 0, 0, 0, 0, 0, -1))
+                        text = m.group(3)
+                    times.append(t)
+                    db.execute("INSERT INTO events (t, kind, player, persona, text, importance) VALUES (?, 'observed', ?, 'legacy', ?, 3)",
+                               (t, name, f"{name}: {text}"))
+                db.execute("INSERT OR IGNORE INTO players (name, first_seen, last_seen) VALUES (?, ?, ?)",
+                           (name, min(times), max(times)))
+            for kind, rows in (("give", state.get("gifts") or []), ("take", state.get("takes") or [])):
+                for r in rows:
+                    if PLAYER.match(str(r.get("player"))):
+                        t = r.get("t", now)
+                        db.execute("INSERT INTO players (name, first_seen, last_seen) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE "
+                                   "SET first_seen = MIN(first_seen, excluded.first_seen), last_seen = MAX(last_seen, excluded.last_seen)",
+                                   (r["player"], t, t))
+                    detail = json.dumps({"item": r.get("item"), "count": r.get("count")})
+                    db.execute("INSERT INTO actions (t, persona, player, kind, detail, diamonds) VALUES (?, 'legacy', ?, ?, ?, ?)",
+                               (r.get("t", now), r.get("player"), kind, detail, as_int(r.get("diamonds"), 0)))
+            for key, t in (state.get("cooldowns") or {}).items():
+                db.execute("INSERT OR REPLACE INTO cooldowns (key, last_used) VALUES (?, ?)", (key, float(t)))
+            history = state.get("history") or []
+            for i, line in enumerate(history):
+                kind, player, importance = classify(line, state.get("players") or {})
+                db.execute("INSERT INTO events (t, kind, player, persona, text, importance) VALUES (?, ?, ?, 'legacy', ?, ?)",
+                           (now - len(history) + i, kind, player, line, importance))
+            db.execute("INSERT INTO meta (key, value) VALUES ('imported_state', ?)", (str(now),))
+        log(f"imported state.json: {len(state.get('players') or {})} players, {len(state.get('history') or [])} log lines")
+
+    def add_event(self, kind: str, text: str, player: str | None, persona: str, importance: int,
+                  dim: str | None = None) -> int:
+        return self.x("INSERT INTO events (t, kind, player, persona, text, importance, dim) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (time.time(), kind, player, persona, text, importance, dim))
+
+    def recent_lines(self, n: int, before_id: int | None = None) -> list[str]:
+        rows = self.q("SELECT text FROM (SELECT id, text FROM events WHERE kind != 'bot_action' AND id < ? "
+                      "ORDER BY id DESC LIMIT ?) ORDER BY id", (before_id or 2**62, n))
+        return [r["text"] for r in rows]
+
+    def last_used(self, key: str) -> float:
+        row = self.one("SELECT last_used FROM cooldowns WHERE key = ?", (key,))
+        return row["last_used"] if row else 0.0
+
+    def set_used(self, key: str) -> None:
+        self.x("INSERT OR REPLACE INTO cooldowns (key, last_used) VALUES (?, ?)", (key, time.time()))
+
+    def add_action(self, persona: str, player: str | None, kind: str, detail: dict, diamonds: int = 0) -> None:
+        self.x("INSERT INTO actions (t, persona, player, kind, detail, diamonds) VALUES (?, ?, ?, ?, ?, ?)",
+               (time.time(), persona, player, kind, json.dumps(detail), diamonds))
+
+    def diamonds_since(self, player: str, since: float) -> int:
+        row = self.one("SELECT COALESCE(SUM(diamonds), 0) AS d FROM actions WHERE player = ? AND kind = 'give' AND t > ?",
+                       (player, since))
+        return row["d"]
+
+    def relationship(self, persona: str, player: str) -> sqlite3.Row:
+        self.x("INSERT OR IGNORE INTO relationships (persona, player) VALUES (?, ?)", (persona, player))
+        return self.one("SELECT * FROM relationships WHERE persona = ? AND player = ?", (persona, player))
+
+    def change_opinion(self, persona: str, player: str, delta: int, low: int, high: int, note: str) -> None:
+        with self.tx() as db:
+            db.execute("INSERT OR IGNORE INTO relationships (persona, player) VALUES (?, ?)", (persona, player))
+            db.execute("UPDATE relationships SET opinion = MAX(?, MIN(opinion + ?, ?)), last_interaction = ? "
+                       "WHERE persona = ? AND player = ?", (low, delta, high, time.time(), persona, player))
+            if note:
+                db.execute("INSERT INTO opinion_changes (persona, player, t, delta, note) VALUES (?, ?, ?, ?, ?)",
+                           (persona, player, time.time(), delta, note))
+
+    def opinion_notes(self, persona: str, player: str, n: int) -> list[sqlite3.Row]:
+        return self.q("SELECT * FROM (SELECT * FROM opinion_changes WHERE persona = ? AND player = ? "
+                      "ORDER BY t DESC LIMIT ?) ORDER BY t", (persona, player, n))
+
+
 class Observer:
     def __init__(self) -> None:
         self.events: queue.Queue[str] = queue.Queue()
-        self.state = self.load_state()
-        self.history: deque[str] = deque(self.state.get("history", []), maxlen=25)
+        self.mem = Memory()
         self.online: set[str] = set()
         self.vitals: dict[str, dict] = {}
         self.last_said = 0.0
         self.last_event = time.time()
         self.pool = ThreadPoolExecutor(max_workers=8)
 
-    def load_state(self) -> dict:
-        try:
-            state = json.loads(STATE_FILE.read_text())
-        except Exception:
-            state = {}
-        state.setdefault("gifts", [])
-        state.setdefault("takes", [])
-        state.setdefault("players", {})
-        state.setdefault("cooldowns", {})
-        return state
-
-    def save_state(self) -> None:
-        self.state["history"] = list(self.history)
-        tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=1))
-        tmp.replace(STATE_FILE)
-
     def ready(self, key: str, cooldown: int) -> bool:
-        return time.time() - self.state["cooldowns"].get(key, 0) > cooldown
+        return time.time() - self.mem.last_used(key) > cooldown
 
     def used(self, key: str) -> None:
-        self.state["cooldowns"][key] = time.time()
-
-    def profile(self, player: str) -> dict:
-        return self.state["players"].setdefault(player, {"opinion": 0, "notes": []})
+        self.mem.set_used(key)
 
     def diamonds_last_hour(self, player: str) -> int:
-        cutoff = time.time() - 3600
-        return sum(g["diamonds"] for g in self.state["gifts"] if g["player"] == player and g["t"] > cutoff)
+        return self.mem.diamonds_since(player, time.time() - 3600)
+
+    def record(self, body: str, slug: str) -> int:
+        kind, player, importance = classify(body, self.online)
+        return self.mem.add_event(kind, body, player, slug, importance)
 
     def refresh_online(self) -> None:
         names = re.findall(r"^\w+: (.*)$", rcon("list"), re.M)
@@ -403,15 +579,17 @@ class Observer:
                 return True
         return random.random() < p["chattiness"]
 
-    def player_block(self, player: str, detailed: bool) -> str:
-        prof = self.profile(player)
+    def player_block(self, player: str, detailed: bool, slug: str) -> str:
+        rel = self.mem.relationship(slug, player)
+        notes = [f"{time.strftime('%m-%d', time.localtime(n['t']))} {n['note']} ({n['delta']:+d})"
+                 for n in self.mem.opinion_notes(slug, player, 5)]
         v = self.vitals.get(player) or {}
         scores = rcon(f"scoreboard players list {player}")
         stats = dict(re.findall(r"\[(obs_\w+)\]: (\d+)", scores)) or dict(
             (k, v2) for v2, k in re.findall(r"(\d+) \((obs_\w+)\)", scores))
         totals, worn = read_inventory(player)
         lines = [
-            f"{player}: opinion {prof['opinion']:+d} | notes: {'; '.join(prof['notes'][-5:]) or 'none yet'}",
+            f"{player}: opinion {rel['opinion']:+d} | notes: {'; '.join(notes) or 'none yet'}",
             f"  health {v.get('health', '?')}/20, food {v.get('food', '?')}/20, {v.get('dim', '?')}, y={v.get('y', '?')} | "
             f"deaths {stats.get('obs_deaths', 0)}, mob kills {stats.get('obs_kills', 0)}, player kills {stats.get('obs_pvp', 0)}",
             f"  {wealth_summary(totals, worn)}",
@@ -424,13 +602,12 @@ class Observer:
 
     def handle(self, batch: list[str]) -> None:
         self.last_event = time.time()
+        p = persona()
         for body in batch:
             if "joined the game" in body or "left the game" in body:
                 self.refresh_online()
-            self.history.append(body)
-        p = persona()
+            self.record(body, p["slug"])
         if not self.online or not self.worth_model_call(batch, p):
-            self.save_state()
             return
         speakers = {m.group(1) for b in batch if (m := CHAT.match(b))}
         involved = {n for b in batch for n in self.online if n in b} or set(self.online)
@@ -444,7 +621,7 @@ class Observer:
             "title": self.ready("title", TITLE_COOLDOWN),
         }
         world_job = self.pool.submit(rcon, "time")
-        block_jobs = [self.pool.submit(self.player_block, n, n in speakers) for n in sorted(involved)]
+        block_jobs = [self.pool.submit(self.player_block, n, n in speakers, p['slug']) for n in sorted(involved)]
         blocks = [j.result() for j in block_jobs]
         world_time = (world_job.result().splitlines() or ["time unknown"])[0]
         prompt = (
@@ -452,8 +629,8 @@ class Observer:
             f"World: {world_time}\n"
             f"Actions available now: {', '.join(k for k, ok in avail.items() if ok) or 'only say/give/take/potion/effect'}\n\n"
             "Players involved:\n" + "\n".join(blocks) + "\n" +
-            "".join(f"Other online: {n}: opinion {self.profile(n)['opinion']:+d}\n" for n in others) +
-            "\nRecent server log (oldest first, your own lines included):\n" + "\n".join(self.history) +
+            "".join(f"Other online: {n}: opinion {self.mem.relationship(p['slug'], n)['opinion']:+d}\n" for n in others) +
+            "\nRecent server log (oldest first, your own lines included):\n" + "\n".join(self.mem.recent_lines(25)) +
             "\n\nNEW (react to these, or stay silent):\n" + "\n".join(batch)
         )
         t0 = time.time()
@@ -461,7 +638,6 @@ class Observer:
         log(f"model {time.time() - t0:.1f}s -> {action}")
         if action:
             self.execute(action, speakers)
-        self.save_state()
 
     def ask_model(self, p: dict, prompt: str) -> dict | None:
         system = f"You speak in Minecraft chat on a server of adult friends.\n\n{p['body']}\n\n{RULES}"
@@ -514,7 +690,8 @@ class Observer:
                 time.sleep(wait)
             say(text)
             self.last_said = time.time()
-            self.history.append(f"<{persona()['name']}> {text}")
+            p = persona()
+            self.mem.add_event("bot_say", f"<{p['name']}> {text}", None, p["slug"], 1)
 
     def target(self, value: dict) -> str | None:
         player = value.get("player") if isinstance(value, dict) else None
@@ -525,12 +702,9 @@ class Observer:
             player = c.get("player") if isinstance(c, dict) else None
             if not isinstance(player, str) or not PLAYER.match(player):
                 continue
-            prof = self.profile(player)
             delta = max(-3, min(as_int(c.get("delta"), 0), 3))
-            prof["opinion"] = max(-10, min(prof["opinion"] + delta, 10))
             note = " ".join(str(c.get("note", "")).split())[:80]
-            if note:
-                prof["notes"] = (prof["notes"] + [f"{time.strftime('%m-%d')} {note} ({delta:+d})"])[-12:]
+            self.mem.change_opinion(persona()["slug"], player, delta, -10, 10, note)
 
     def give_all(self, gifts) -> None:
         for g in (gifts if isinstance(gifts, list) else [gifts])[:3]:
@@ -552,8 +726,7 @@ class Observer:
         result = rcon(f"give {player} minecraft:{bare} {count}")
         log(result)
         if result.startswith(("Gave", "Giving")):
-            self.state["gifts"] = (self.state["gifts"] + [
-                {"t": time.time(), "player": player, "item": bare, "count": count, "diamonds": diamonds}])[-300:]
+            self.mem.add_action(persona()["slug"], player, "give", {"item": bare, "count": count}, diamonds)
 
     def take(self, t: dict, speakers: set[str]) -> None:
         player, item = self.target(t), str(t.get("item", ""))
@@ -567,8 +740,7 @@ class Observer:
             log(f"take refused for item {bare}")
             return
         log(rcon(f"clear {player} minecraft:{bare} {count}"))
-        self.state["takes"] = (self.state["takes"] + [
-            {"t": time.time(), "player": player, "item": bare, "count": count}])[-300:]
+        self.mem.add_action(persona()["slug"], player, "take", {"item": bare, "count": count})
 
     def summon(self, s: dict) -> None:
         player = self.target(s)
