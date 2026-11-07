@@ -13,7 +13,8 @@ potions, smites, time/weather). Plain Python 3 stdlib, no dependencies; runs on 
 systemctl --user stop mc-observer
 journalctl --user -u mc-observer -f     # each model call with timing + JSON, plus refusals
 python3 -I -m py_compile observer.py    # syntax check
-sqlite3 -readonly memory.db "SELECT * FROM relationships"   # inspect memory (WAL: safe while running)
+python3 -I -c "import sqlite3; d = sqlite3.connect('file:memory.db?mode=ro', uri=True)
+[print(tuple(r)) for r in d.execute('SELECT * FROM relationships')]"   # inspect memory (no sqlite3 CLI here)
 journalctl --user -u mc-observer | grep usage   # token use per call; call=reply|review
 ```
 
