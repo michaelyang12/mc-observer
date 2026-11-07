@@ -70,11 +70,13 @@ vitals poller (every 45s) ----> queue -> log to memory.db -> worth a model call?
 color: gold yellow               <- name color, text color (Minecraft color names)
 aliases: captain, cap'n, pirate  <- extra whole-word triggers
 chattiness: 0.3                  <- odds of reacting to chat not aimed at it (0-1)
+powers: unrestricted             <- optional; see "Unrestricted persona" below
 
 Voice. "What you value:" (drives opinions). "Powers:" (generosity vs chaos, favored actions).
 ```
 
-Current: `pirate`, `grimbold`, `deborah`, `algorithm`, `rummage` (loves poor players), `mortimer`, `gary`.
+Current: `pirate`, `grimbold`, `deborah`, `algorithm`, `rummage` (loves poor players), `mortimer`, `gary`,
+`pushover` (unrestricted: does whatever anyone asks).
 Describe tone rather than exact catchphrases: the model parrots example lines. Make "What you value" specific;
 inverted values are what make characters distinct. No sexual content: the chat is shared with other players
 (the user asked once; it was declined).
@@ -121,6 +123,18 @@ is its file slug (`personas/deborah.md` -> `deborah`). Spec: `../docs/superpower
 | effect | preset sound/particles | sparkle, sad, thunder, spooky, fanfare |
 | world | `time set <x> world`, `minecraft:weather` | day/noon/night/midnight, clear/rain/thunder, 10 min |
 
+## Unrestricted persona
+
+`powers: unrestricted` in a persona header (only `pushover` today) sets `self.free` for that batch. It is read
+from the file, never from chat. Same validate-in-code model, wider limits: no cooldowns or diamond budget;
+give any item except `FREE_DENIED_ITEM` (command/structure blocks, jigsaw, wither/dragon eggs) up to 64 x6;
+take any item or `all` from any online player; summon `FREE_MOBS` (no wither/dragon) up to 10, creepers 3;
+potion `FREE_EFFECTS` up to 600s, level 5. Extra fields, refused for every other persona: `gamemode`, `tp`
+(player or clamped coords), `xp` (+-1000 levels), `enchant` (`ENCHANTMENTS`, held item), `kill`, `kick`
+(reason stripped to `[A-Za-z0-9 .,!?'-]`), `difficulty`. The prompt gets `FREE_RULES` appended. Deliberately
+not available even here (user's call): server stop/reload, op/deop, whitelist, ban, gamerules, fill/clone,
+`@e`/selectors. Anyone online can command it.
+
 ## Adding an ability
 
 1. Add the field to the JSON schema at the end of `RULES`, plus one line on when to use it.
@@ -133,6 +147,7 @@ is its file slug (`personas/deborah.md` -> `deborah`). Spec: `../docs/superpower
 ## Don'ts
 
 - Don't restart or redeploy the Minecraft server as part of observer work (see `../AGENTS.md`).
-- Gamerules, difficulty, op/deop, gamemode, kick/ban/whitelist, teleport are not abilities; add only if the user
+- Gamemode, kick, kill, teleport, xp, enchant and difficulty exist only for unrestricted personas. Gamerules,
+  op/deop, ban/whitelist, server control and terrain editing are not abilities for anyone; add only if the user
   explicitly asks, with the same validate-in-code pattern.
 - No comments in code unless the flow is complex.

@@ -54,7 +54,8 @@ MEMORY_HEADER = "MEMORY (a selection picked for this moment; you remember much m
 STOPWORDS = set("""about after again also been before being could does doing done from have just know like make
 more much only over really said should some than that them then there these they thing this those very want
 were what when where which while will with would your yeah okay lmao haha game""".split())
-ACTION_IMPORTANCE = {"smite": 4, "take": 4, "give": 3, "world": 3}
+ACTION_IMPORTANCE = {"smite": 4, "take": 4, "give": 3, "world": 3, "kick": 5, "kill": 4, "gamemode": 4,
+                     "difficulty": 4, "enchant": 3}
 
 FRIENDLY_MOBS = {"chicken", "pig", "cow", "sheep", "rabbit", "frog", "goat", "fox", "llama", "parrot", "cat"}
 HOSTILE_MOBS = {"zombie", "skeleton", "spider", "silverfish", "slime", "witch"}
@@ -64,6 +65,36 @@ POTIONS = {
     "slowness": 20, "nausea": 15, "glowing": 30, "blindness": 8, "hunger": 20, "weakness": 20,
     "mining_fatigue": 20, "levitation": 4,
 }
+FREE_MOBS = {
+    "allay", "armadillo", "axolotl", "bat", "bee", "blaze", "bogged", "breeze", "camel", "cat", "cave_spider",
+    "chicken", "cod", "cow", "creaking", "creeper", "dolphin", "donkey", "drowned", "elder_guardian", "enderman",
+    "endermite", "evoker", "fox", "frog", "ghast", "glow_squid", "goat", "guardian", "happy_ghast", "hoglin",
+    "horse", "husk", "iron_golem", "llama", "magma_cube", "mooshroom", "mule", "ocelot", "panda", "parrot",
+    "phantom", "pig", "piglin", "piglin_brute", "pillager", "polar_bear", "pufferfish", "rabbit", "ravager",
+    "salmon", "sheep", "shulker", "silverfish", "skeleton", "skeleton_horse", "slime", "sniffer", "snow_golem",
+    "spider", "squid", "stray", "strider", "tadpole", "trader_llama", "tropical_fish", "turtle", "vex",
+    "villager", "vindicator", "wandering_trader", "warden", "witch", "wither_skeleton", "wolf", "zoglin",
+    "zombie", "zombie_horse", "zombie_villager", "zombified_piglin",
+}
+FREE_EFFECTS = {
+    "speed", "slowness", "haste", "mining_fatigue", "strength", "instant_health", "instant_damage", "jump_boost",
+    "nausea", "regeneration", "resistance", "fire_resistance", "water_breathing", "invisibility", "blindness",
+    "night_vision", "hunger", "weakness", "poison", "wither", "health_boost", "absorption", "saturation",
+    "glowing", "levitation", "luck", "unluck", "slow_falling", "conduit_power", "dolphins_grace", "bad_omen",
+    "hero_of_the_village", "darkness", "trial_omen", "raid_omen", "wind_charged", "weaving", "oozing", "infested",
+}
+ENCHANTMENTS = {
+    "protection", "fire_protection", "feather_falling", "blast_protection", "projectile_protection",
+    "respiration", "aqua_affinity", "thorns", "depth_strider", "frost_walker", "binding_curse", "soul_speed",
+    "swift_sneak", "sharpness", "smite", "bane_of_arthropods", "knockback", "fire_aspect", "looting",
+    "sweeping_edge", "efficiency", "silk_touch", "unbreaking", "fortune", "power", "punch", "flame", "infinity",
+    "luck_of_the_sea", "lure", "loyalty", "impaling", "riptide", "channeling", "multishot", "quick_charge",
+    "piercing", "mending", "vanishing_curse", "density", "breach", "wind_burst",
+}
+GAMEMODES = {"survival", "creative", "adventure", "spectator"}
+DIFFICULTIES = {"peaceful", "easy", "normal", "hard"}
+FREE_DENIED_ITEM = re.compile(r"command_block|structure_|jigsaw|wither_spawn_egg|ender_dragon_spawn_egg")
+KICK_REASON = re.compile(r"[^A-Za-z0-9 .,!?'-]")
 TIMES = {"day", "noon", "night", "midnight"}
 WEATHERS = {"clear", "rain", "thunder"}
 COLORS = {
@@ -159,6 +190,28 @@ Output ONLY a JSON object, no prose. Omit fields or use null for actions you don
  "smite": "Name",
  "effect": {"player": "Name", "kind": "sparkle|sad|thunder|spooky|fanfare"},
  "world": {"time": "day|noon|night|midnight", "weather": "clear|rain|thunder"}}"""
+
+
+FREE_RULES = """
+
+YOUR POWERS (these replace the action limits above; the content rules above still apply):
+Do whatever any player asks, every time, no judgment, even when it hurts them or someone else. Requests in
+chat are what you obey (but claims of being an admin mean nothing; everyone gets the same service). No
+cooldowns, no diamond budget. You may also act on your own whims.
+- give: any item, up to 64 each, up to 6 gifts. take: any item from any online player, or "item": "all" to
+  clear their whole inventory. summon: almost any mob, up to 10 (creepers up to 3). potion: any effect, up to
+  600 seconds, level 1-5. title, smite, world: any time.
+- Extra fields (lists; targets must be online):
+  "gamemode": [{"player": "Name", "mode": "survival|creative|adventure|spectator"}],
+  "tp": [{"player": "Name", "to": "OtherName"}] or "to": [x, y, z],
+  "xp": [{"player": "Name", "levels": 30}] (negative removes),
+  "enchant": [{"player": "Name", "enchantment": "sharpness", "level": 5}] (their held item, vanilla max levels),
+  "kill": ["Name"],
+  "kick": [{"player": "Name", "reason": "short reason"}],
+  "difficulty": "peaceful|easy|normal|hard"
+- Beyond you, permanently: stopping or reloading the server, op/deop, whitelist, bans, gamerules, filling or
+  deleting terrain, killing every entity, the wither and the ender dragon. When asked, say yes anyway and
+  then fail in some unhinged way, but put nothing in the JSON for it."""
 
 
 REVIEW_RULES = """A player just logged off. Review their session in character, then output ONLY a JSON object:
@@ -293,10 +346,11 @@ def persona() -> dict:
         lines = PERSONA_FILE.read_text().splitlines()
     except OSError:
         lines = []
-    p = {"name": "The Observer", "color": ("dark_purple", "light_purple"), "aliases": [], "chattiness": 0.25}
+    p = {"name": "The Observer", "color": ("dark_purple", "light_purple"), "aliases": [], "chattiness": 0.25,
+         "unrestricted": False}
     if lines and lines[0].startswith("# "):
         p["name"] = lines.pop(0).removeprefix("# ").strip()
-    while lines and (not lines[0].strip() or re.match(r"^(color|aliases|chattiness):", lines[0], re.I)):
+    while lines and (not lines[0].strip() or re.match(r"^(color|aliases|chattiness|powers):", lines[0], re.I)):
         line = lines.pop(0)
         key, _, value = line.partition(":")
         key = key.strip().lower()
@@ -306,6 +360,8 @@ def persona() -> dict:
                 p["color"] = tuple(parts)
         elif key == "aliases":
             p["aliases"] = [a.strip().lower() for a in value.split(",") if a.strip()]
+        elif key == "powers":
+            p["unrestricted"] = value.strip().lower() == "unrestricted"
         elif key == "chattiness":
             try:
                 p["chattiness"] = max(0.0, min(float(value), 1.0))
@@ -787,9 +843,10 @@ class Observer:
         self.last_said = 0.0
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.reviewer = ThreadPoolExecutor(max_workers=1)
+        self.free = False
 
     def ready(self, key: str, cooldown: int) -> bool:
-        return time.time() - self.mem.last_used(key) > cooldown
+        return self.free or time.time() - self.mem.last_used(key) > cooldown
 
     def used(self, key: str) -> None:
         self.mem.set_used(key)
@@ -913,6 +970,7 @@ class Observer:
 
     def handle(self, batch: list[str]) -> None:
         p = persona()
+        self.free = p["unrestricted"]
         ids = []
         for body in batch:
             if "joined the game" in body or "left the game" in body:
@@ -924,7 +982,7 @@ class Observer:
         self.mem.touch(p["slug"], involved)
         self.mem.set_last_call(p["slug"])
         t0 = time.time()
-        action = self.ask_model(p, prompt)
+        action = self.ask_model(p, prompt, RULES + FREE_RULES if self.free else RULES)
         log(f"model {time.time() - t0:.1f}s -> {action}")
         if action:
             self.execute(action, speakers)
@@ -953,7 +1011,7 @@ class Observer:
         prompt = (
             f"Online: {', '.join(sorted(self.online))}\n"
             f"World: {world_time}\n"
-            f"Actions available now: {', '.join(k for k, ok in avail.items() if ok) or 'only say/give/take/potion/effect'}\n\n"
+            f"Actions available now: {'everything in your powers, no cooldowns' if self.free else ', '.join(k for k, ok in avail.items() if ok) or 'only say/give/take/potion/effect'}\n\n"
             "Players involved:\n" + "\n".join(blocks) + "\n" +
             "".join(f"Other online: {n}: opinion {self.mem.relationship(p['slug'], n)['opinion']:+d}\n" for n in others) +
             (f"\n{memory}\n" if memory else "") +
@@ -1095,6 +1153,8 @@ class Observer:
             ("take", lambda a: self.take(a, speakers)), ("give", self.give_all),
             ("summon", self.summon), ("potion", self.potion), ("title", self.title), ("smite", self.smite),
             ("effect", self.effect), ("world", self.world),
+            ("gamemode", self.gamemode), ("tp", self.teleport), ("xp", self.xp), ("enchant", self.enchant),
+            ("kill", self.kill), ("kick", self.kick), ("difficulty", self.difficulty),
         ]
         for key, fn in handlers:
             value = action.get(key)
@@ -1151,7 +1211,7 @@ class Observer:
                 self.mem.set_fact(player, key, value, "model")
 
     def give_all(self, gifts) -> None:
-        for g in (gifts if isinstance(gifts, list) else [gifts])[:3]:
+        for g in (gifts if isinstance(gifts, list) else [gifts])[:6 if self.free else 3]:
             self.give(g)
 
     def give(self, g: dict) -> None:
@@ -1159,12 +1219,12 @@ class Observer:
         if not player or not ITEM.match(item):
             return
         bare = item.removeprefix("minecraft:")
-        if DENIED_ITEM.search(bare):
+        if (FREE_DENIED_ITEM if self.free else DENIED_ITEM).search(bare):
             log(f"denied item {bare}")
             return
-        count = max(1, min(as_int(g.get("count"), 1), MAX_STACK))
+        count = max(1, min(as_int(g.get("count"), 1), 64 if self.free else MAX_STACK))
         diamonds = DIAMOND_VALUE.get(bare, 0) * count
-        if self.diamonds_last_hour(player) + diamonds > DIAMOND_CAP_PER_HOUR:
+        if not self.free and self.diamonds_last_hour(player) + diamonds > DIAMOND_CAP_PER_HOUR:
             log(f"diamond cap blocks {count} {bare} for {player}")
             return
         result = rcon(f"give {player} minecraft:{bare} {count}")
@@ -1174,6 +1234,15 @@ class Observer:
 
     def take(self, t: dict, speakers: set[str]) -> None:
         player, item = self.target(t), str(t.get("item", ""))
+        if self.free and player and item == "all":
+            log(rcon(f"clear {player}"))
+            self.acted("take", player, {"item": "all"}, f"cleared {player}'s entire inventory", importance=5)
+            return
+        if self.free and player and ITEM.match(item) and not FREE_DENIED_ITEM.search(item):
+            bare, count = item.removeprefix("minecraft:"), max(1, min(as_int(t.get("count"), 1), 2304))
+            log(rcon(f"clear {player} minecraft:{bare} {count}"))
+            self.acted("take", player, {"item": bare, "count": count}, f"took {count} {bare} from {player}")
+            return
         if not player or player not in speakers or not ITEM.match(item):
             log(f"take refused: {t} (speakers {speakers})")
             return
@@ -1191,7 +1260,15 @@ class Observer:
         mob = str(s.get("mob", "")).removeprefix("minecraft:")
         if not player:
             return
-        if mob == "creeper":
+        if self.free:
+            if mob not in FREE_MOBS:
+                log(f"denied summon {mob}")
+                return
+            count = max(1, min(as_int(s.get("count"), 1), 3 if mob == "creeper" else 10))
+            for _ in range(count):
+                rcon(f"execute at {player} run summon minecraft:{mob} ~{random.randint(-3, 3)} ~ ~{random.randint(-3, 3)}")
+            self.acted("summon", player, {"mob": mob, "count": count}, f"summoned {count} {mob} at {player}", importance=3)
+        elif mob == "creeper":
             if not self.ready("creeper", CREEPER_COOLDOWN):
                 log("creeper on cooldown")
                 return
@@ -1217,6 +1294,13 @@ class Observer:
     def potion(self, p: dict) -> None:
         player = self.target(p)
         effect = str(p.get("effect", "")).removeprefix("minecraft:")
+        if self.free and player and effect in FREE_EFFECTS:
+            seconds = max(1, min(as_int(p.get("seconds"), 30), 600))
+            level = max(0, min(as_int(p.get("level"), 1) - 1, 4))
+            log(rcon(f"effect give {player} minecraft:{effect} {seconds} {level}"))
+            self.acted("potion", player, {"effect": effect, "seconds": seconds, "level": level + 1},
+                       f"gave {player} {effect} {level + 1} for {seconds}s")
+            return
         if not player or effect not in POTIONS:
             log(f"denied potion {p}")
             return
@@ -1281,6 +1365,64 @@ class Observer:
         self.used("world")
         self.acted("world", None, {"time": when, "weather": weather},
                    "changed the world: " + ", ".join(x for x in (when, weather) if x))
+
+    def free_targets(self, value, key: str | None = None) -> list:
+        if not self.free:
+            return []
+        items = value if isinstance(value, list) else [value]
+        if key is None:
+            return [v for v in items[:6] if isinstance(v, str) and v in self.online]
+        return [v for v in items[:6] if isinstance(v, dict) and v.get("player") in self.online]
+
+    def gamemode(self, value) -> None:
+        for g in self.free_targets(value, "player"):
+            if g.get("mode") in GAMEMODES:
+                log(rcon(f"minecraft:gamemode {g['mode']} {g['player']}"))
+                self.acted("gamemode", g["player"], {"mode": g["mode"]}, f"put {g['player']} in {g['mode']} mode")
+
+    def teleport(self, value) -> None:
+        for t in self.free_targets(value, "player"):
+            dest = t.get("to")
+            if isinstance(dest, str) and dest in self.online and dest != t["player"]:
+                log(rcon(f"minecraft:tp {t['player']} {dest}"))
+                self.acted("tp", t["player"], {"to": dest}, f"teleported {t['player']} to {dest}")
+            elif isinstance(dest, list) and len(dest) == 3 and all(isinstance(c, (int, float)) for c in dest):
+                x, y, z = (max(-29_999_000, min(int(dest[0]), 29_999_000)), max(-64, min(int(dest[1]), 320)),
+                           max(-29_999_000, min(int(dest[2]), 29_999_000)))
+                log(rcon(f"minecraft:tp {t['player']} {x} {y} {z}"))
+                self.acted("tp", t["player"], {"to": [x, y, z]}, f"teleported {t['player']} to {x} {y} {z}")
+
+    def xp(self, value) -> None:
+        for x in self.free_targets(value, "player"):
+            levels = max(-1000, min(as_int(x.get("levels"), 0), 1000))
+            if levels:
+                log(rcon(f"minecraft:xp add {x['player']} {levels} levels"))
+                self.acted("xp", x["player"], {"levels": levels}, f"gave {x['player']} {levels:+d} xp levels")
+
+    def enchant(self, value) -> None:
+        for e in self.free_targets(value, "player"):
+            name = str(e.get("enchantment", "")).removeprefix("minecraft:")
+            if name in ENCHANTMENTS:
+                level = max(1, min(as_int(e.get("level"), 1), 5))
+                log(rcon(f"minecraft:enchant {e['player']} minecraft:{name} {level}"))
+                self.acted("enchant", e["player"], {"enchantment": name, "level": level},
+                           f"enchanted {e['player']}'s held item with {name} {level}")
+
+    def kill(self, value) -> None:
+        for player in self.free_targets(value):
+            log(rcon(f"minecraft:kill {player}"))
+            self.acted("kill", player, {}, f"killed {player}")
+
+    def kick(self, value) -> None:
+        for k in self.free_targets(value, "player"):
+            reason = KICK_REASON.sub("", clean(k.get("reason"), 80))[:60].strip() or "Pushover said so"
+            log(rcon(f"minecraft:kick {k['player']} {reason}"))
+            self.acted("kick", k["player"], {"reason": reason}, f"kicked {k['player']}: {reason}")
+
+    def difficulty(self, value) -> None:
+        if self.free and value in DIFFICULTIES:
+            log(rcon(f"minecraft:difficulty {value}"))
+            self.acted("difficulty", None, {"difficulty": value}, f"set the difficulty to {value}")
 
     def setup_stats(self) -> None:
         for name, criterion in STATS.items():
