@@ -916,12 +916,20 @@ class Observer:
         self.mem.add_action(p["slug"], player, kind, detail, diamonds)
         self.mem.add_event("bot_action", f"{p['name']} {text}", player, p["slug"], importance or ACTION_IMPORTANCE.get(kind, 2))
 
-    def refresh_online(self) -> None:
-        accounts = re.findall(r"\b(\w{3,16}) \(([0-9a-f-]{36})\)", rcon("minecraft:list uuids"))
+    def refresh_online(self) -> bool:
+        for _ in range(2):
+            reply = rcon("minecraft:list uuids")
+            if not reply.startswith("ERROR"):
+                break
+        else:
+            log(f"online list unavailable, keeping {sorted(self.online)}: {reply}")
+            return False
+        accounts = re.findall(r"\b(\w{3,16}) \(([0-9a-f-]{36})\)", reply)
         for name, uuid in accounts:
             if old := self.mem.identify(name, uuid):
                 log(f"{old} is now {name}: memory moved")
         self.online = {name for name, _ in accounts}
+        return True
 
     def tail(self) -> None:
         while True:
@@ -935,7 +943,7 @@ class Observer:
                 if not m or "RCON" in m.group(1):
                     continue
                 body = m.group(1)
-                if CHAT.match(body) or any(h in body for h in EVENT_HINTS):
+                if CHAT.match(body) or (not body.startswith("[") and any(h in body for h in EVENT_HINTS)):
                     self.events.put(body)
             log("log stream ended; retrying in 30s")
             time.sleep(30)
@@ -1015,10 +1023,16 @@ class Observer:
         self.free = p["unrestricted"]
         ids = []
         for body in batch:
+            chat = CHAT.match(body)
             if "joined the game" in body or "left the game" in body:
                 self.refresh_online()
+            elif chat and chat.group(1) not in self.online and not self.refresh_online():
+                self.online.add(chat.group(1))
             ids.append(self.record(body, p["slug"]))
-        if not self.online or not self.worth_model_call(batch, p):
+        if not self.online:
+            log(f"nobody online, skipping {batch}")
+            return
+        if not self.worth_model_call(batch, p):
             return
         prompt, speakers, involved = self.build_prompt(batch, p, min(ids))
         self.mem.touch(p["slug"], involved)
