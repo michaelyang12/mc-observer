@@ -35,7 +35,7 @@ print(b.ask_model(o.persona(), 'Online: X\n\nNEW (react to these, or stay silent
 docker logs -f minecraft ----\
 vitals poller (every 45s) ----> queue -> log to memory.db -> worth a model call? -> build prompt -> claude -p
   starving / hurt / dimension /        (every event)                      (+ memory)   (sonnet, one-shot, no tools)
-  deep / quiet spell                          validate each JSON field -> RCON / memory.db
+  deep / high                                 validate each JSON field -> RCON / memory.db
 "left the game" -> logoff review on its own thread (one extra call per session >= 2 min)
 ```
 

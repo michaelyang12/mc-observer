@@ -33,7 +33,6 @@ WORLD_COOLDOWN = 600
 DIAMOND_CAP_PER_HOUR = 8
 MAX_STACK = 32
 OBSERVE_EVERY = 45
-QUIET_AFTER = 360
 
 OPINION_RANGE = 100
 OPINION_STEP = 15
@@ -786,7 +785,6 @@ class Observer:
         self.online: set[str] = set()
         self.vitals: dict[str, dict] = {}
         self.last_said = 0.0
-        self.last_event = time.time()
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.reviewer = ThreadPoolExecutor(max_workers=1)
 
@@ -879,8 +877,6 @@ class Observer:
                 notes.append(f"{p} is digging deep underground (y={now['y']})")
             if now["y"] > 160 >= prev["y"]:
                 notes.append(f"{p} climbed very high (y={now['y']})")
-        if not notes and self.online and time.time() - self.last_event > QUIET_AFTER and random.random() < 0.5:
-            notes.append("it has been quiet for a while; comment on something, act on a whim, or stay silent")
         for n in notes:
             self.events.put(f"OBSERVED: {n}")
 
@@ -916,7 +912,6 @@ class Observer:
         return "\n".join(lines)
 
     def handle(self, batch: list[str]) -> None:
-        self.last_event = time.time()
         p = persona()
         ids = []
         for body in batch:
