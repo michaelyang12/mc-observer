@@ -1,7 +1,7 @@
 # AGENTS.md
 
 mc-observer: an all-seeing AI character in Minecraft chat (Cap'n Claude, Grimbold, Deborah the HOA president,
-...). It watches chat and game events, keeps an opinion of each player, and acts on gameplay (gifts, mobs,
+...). It watches chat and game events, remembers players per persona (SQLite), and acts on gameplay (gifts, mobs,
 potions, smites, time/weather). Plain Python 3 stdlib, no dependencies; runs on the host as a systemd user unit.
 
 ## Commands
@@ -13,13 +13,16 @@ potions, smites, time/weather). Plain Python 3 stdlib, no dependencies; runs on 
 systemctl --user stop mc-observer
 journalctl --user -u mc-observer -f     # each model call with timing + JSON, plus refusals
 python3 -I -m py_compile observer.py    # syntax check
+sqlite3 -readonly memory.db "SELECT * FROM relationships"   # inspect memory (WAL: safe while running)
+journalctl --user -u mc-observer | grep usage   # token use per call; call=reply|review
 ```
 
 After editing `observer.py`: `python3 -I -m py_compile observer.py && ./start`, then watch the journal.
 Persona edits need no restart. The unit is transient (`systemd-run`) and does not survive a host reboot; rerun
 `./start`. Lines logged during the ~1s restart are missed.
 
-Dry-run a persona without touching the server (prints the model's JSON, executes nothing):
+Dry-run a persona without touching the server (prints the model's JSON, executes nothing; uses `memory.db`
+in this directory, creating it if missing):
 ```sh
 python3 -I -c "import sys; sys.path.insert(0,'.'); import observer as o
 o.PERSONA_FILE = o.HERE/'personas/grimbold.md'; b = o.Observer(); b.refresh_online()
@@ -30,9 +33,10 @@ print(b.ask_model(o.persona(), 'Online: X\n\nNEW (react to these, or stay silent
 
 ```
 docker logs -f minecraft ----\
-vitals poller (every 45s) ----> queue -> worth a model call? -> build prompt -> claude -p --model sonnet
-  starving / hurt / dimension /                                                   (one-shot, no tools, ~3-4s)
-  deep / quiet spell                                         validate each JSON action -> RCON -> server
+vitals poller (every 45s) ----> queue -> log to memory.db -> worth a model call? -> build prompt -> claude -p
+  starving / hurt / dimension /        (every event)                      (+ memory)   (sonnet, one-shot, no tools)
+  deep / quiet spell                          validate each JSON field -> RCON / memory.db
+"left the game" -> logoff review on its own thread (one extra call per session >= 2 min)
 ```
 
 - Model calls: deaths, advancements, joins/leaves, observations always; chat when it names the persona or an
@@ -54,7 +58,8 @@ vitals poller (every 45s) ----> queue -> worth a model call? -> build prompt -> 
 | `observer.py` | The bot. Limits/cooldowns at the top, `RULES` prompt, `execute()` and one handler per action |
 | `personas/<name>.md` | One character per file, read on every call |
 | `persona.md` | Symlink to the active persona (gitignored) |
-| `state.json` | Memory: opinions/notes per player, gifts, takes, cooldowns, last 25 log lines (gitignored) |
+| `memory.db` | SQLite memory: events, sessions, per-persona relationships and memories, facts, actions, cooldowns (gitignored) |
+| `state.json` | Pre-SQLite memory. Imported once into `memory.db` on first start, then never read again (gitignored) |
 
 ## Personas
 
@@ -75,11 +80,31 @@ inverted values are what make characters distinct. No sexual content: the chat i
 
 ## Memory
 
-`state.json` `players.<name>`: `opinion` (-10..10, starts 0) and the last 12 `notes`. The model returns
-`opinion` deltas, clamped to -3..+3 per event; prompts show involved players' score + last 5 notes.
-Opinions are shared across personas (?: per-persona scores not implemented). Deaths/kills come from hidden
-scoreboard objectives `obs_deaths`, `obs_kills`, `obs_pvp`, created at startup. Edit `state.json` only while
-the unit is stopped; it's rewritten after every event.
+`memory.db` (WAL, one connection behind an `RLock` in `Memory`; standard-library `sqlite3` with FTS5). A persona
+is its file slug (`personas/deborah.md` -> `deborah`). Spec: `../docs/superpowers/specs/2026-11-07-observer-memory-design.md`.
+
+- Shared by all personas: `events` (every chat line, game event, observation, bot line and action, with an
+  importance 1..10 set by code; never deleted), `sessions` (+ neutral summary from the logoff review),
+  `players`, `facts` (<=15 per player, a new value per key overwrites), `actions` (diamond budget), `cooldowns`.
+- Private to a persona: `relationships` (opinion -100..100, familiarity, impression, nickname),
+  `opinion_changes` (delta + note), `memories` (moment/grudge/favor/promise/joke, linked to players through
+  `memory_players`; no links = the persona's own experience).
+- Writes: code logs events/actions. The reply JSON may carry `opinion` (delta clamped to -15..+15), `memory`
+  and `fact` (<=2 each, players must be known, text capped). Open promises/grudges/favors: <=5 per persona per
+  player (a sixth resolves the least important), auto-resolved after 30 days.
+- Reads: `Memory.context()` builds the MEMORY section, capped at `MEMORY_BUDGET` (2,200 chars), filled in
+  priority order and never truncated mid-item: catch-up ("since you were last active", <=600 chars, only when
+  another persona logged events since this one's last call), opinion + last 2 notes, open items, impression,
+  ranked memories (importance / sqrt(1 + age_days/7), +2 on an FTS keyword match with the batch), 2
+  persona-level memories, facts, FTS-matched past events, last session summary, recent actions. Recent log:
+  last 12 events.
+- Logoff review: on "left the game", `review()` runs on `self.reviewer` (one thread) for sessions >= 2 min
+  with real events. Input: the session log capped at 6,000 chars plus the persona's view. Output: shared
+  `summary`, private `impression`/`nickname`, `merge`/`rescore`/`resolve` by `m<id>`, validated against that
+  persona's memories of that player. Sessions still open at startup are closed without review.
+- Deaths/kills come from hidden scoreboard objectives `obs_deaths`, `obs_kills`, `obs_pvp`, created at startup.
+- Edit `memory.db` only while the unit is stopped. To reset one persona: delete its rows from
+  `relationships`, `opinion_changes` and `memories` (+ orphaned `memory_players`).
 
 ## Abilities (enforced in code)
 
@@ -102,6 +127,7 @@ the unit is stopped; it's rewritten after every event.
 3. Add a handler and register it in `execute()`. Validate every value before `rcon()`: player in `self.online`,
    ids against an allowlist or strict regex, counts clamped, cooldown via `self.ready()`/`self.used()`.
    Never interpolate model text into a command unvalidated. Model on `potion()` or `summon()`.
+4. After it succeeds, call `self.acted(kind, player, detail, text)` so it lands in `actions` and `events`.
 
 ## Don'ts
 
