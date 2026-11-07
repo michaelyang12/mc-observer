@@ -1,6 +1,6 @@
 # AGENTS.md
 
-mc-observer: an all-seeing AI character in Minecraft chat (Cap'n Claude, Grimbold, Deborah the HOA president,
+mc-observer: an all-seeing AI character in Minecraft chat (Cap'n Claude, Grimbold, Dennis Denies,
 ...). It watches chat and game events, remembers players per persona (SQLite), and acts on gameplay (gifts, mobs,
 potions, smites, time/weather). Plain Python 3 stdlib, no dependencies; runs on the host as a systemd user unit.
 
@@ -14,8 +14,8 @@ Paper server in `~/Source/mc-server` (its `AGENTS.md` has the server rules: neve
 
 ```sh
 ./switch                 # list personas and each instance's active one
-./switch deborah         # change main's persona; live on the next reply, no restart
-./switch <i> deborah     # same for another instance
+./switch dennis          # change main's persona; live on the next reply, no restart
+./switch <i> dennis      # same for another instance
 ./start [<i>]            # (re)start the unit mc-observer-<i>
 systemctl --user stop mc-observer-<i>
 journalctl --user -u mc-observer-main -f     # each model call with timing + JSON, plus refusals
@@ -98,8 +98,8 @@ powers: unrestricted             <- optional; see "Unrestricted persona" below
 Voice. "What you value:" (drives opinions). "Powers:" (generosity vs chaos, favored actions).
 ```
 
-Current: `pirate`, `grimbold`, `deborah`, `algorithm`, `rummage` (loves poor players), `mortimer`, `gary`,
-`observer` (the normal one), `neil`, `dennis`, `tribunal`, `pushover` (unrestricted: does whatever anyone asks).
+Current: `pirate`, `grimbold`, `algorithm`, `mortimer`, `gary`, `observer` (the normal one), `neil`, `dennis`,
+`pushover` (unrestricted: does whatever anyone asks).
 Describe tone rather than exact catchphrases: the model parrots example lines. Make "What you value" specific;
 inverted values are what make characters distinct. No sexual content: the chat is shared with other players
 (the user asked once; it was declined).
@@ -107,7 +107,7 @@ inverted values are what make characters distinct. No sexual content: the chat i
 ## Memory
 
 `memory.db` (WAL, one connection behind an `RLock` in `Memory`; standard-library `sqlite3` with FTS5). A persona
-is its file slug (`personas/deborah.md` -> `deborah`). Spec: `docs/2026-11-07-observer-memory-design.md`.
+is its file slug (`personas/dennis.md` -> `dennis`). Spec: `docs/2026-11-07-observer-memory-design.md`.
 
 - Shared by all personas: `events` (every chat line, game event, observation, bot line and action, with an
   importance 1..10 set by code; never deleted), `sessions` (+ neutral summary from the logoff review),

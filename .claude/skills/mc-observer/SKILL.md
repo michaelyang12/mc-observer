@@ -1,6 +1,6 @@
 ---
 name: mc-observer
-description: Operate mc-observer, the all-seeing AI character on the Minecraft server (Cap'n Claude, Grimbold, Deborah the HOA president, etc.) that watches chat and game events, remembers what it thinks of each player, and acts on gameplay (gifts, mobs, potions, smites, time/weather). Use whenever the user wants to switch, add, or tweak a personality, change what the observer may do or its limits/cooldowns, inspect or reset its opinions of players, start/stop/restart it, add it to another server, find out why it did or didn't react, or run rcon commands on the minecraft container, even if they just say "the bot", "the god", "the pirate", or a character's name.
+description: Operate mc-observer, the all-seeing AI character on the Minecraft server (Cap'n Claude, Grimbold, Dennis Denies, etc.) that watches chat and game events, remembers what it thinks of each player, and acts on gameplay (gifts, mobs, potions, smites, time/weather). Use whenever the user wants to switch, add, or tweak a personality, change what the observer may do or its limits/cooldowns, inspect or reset its opinions of players, start/stop/restart it, add it to another server, find out why it did or didn't react, or run rcon commands on the minecraft container, even if they just say "the bot", "the god", "the pirate", or a character's name.
 ---
 
 # mc-observer
