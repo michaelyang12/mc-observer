@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+dir="$(cd "$(dirname "$0")" && pwd)"
+[ -e "$dir/persona.md" ] || ln -s personas/pirate.md "$dir/persona.md"
+systemctl --user stop mc-observer mc-narrator darren-bot 2>/dev/null || true
+systemctl --user reset-failed mc-observer 2>/dev/null || true
+systemd-run --user --unit=mc-observer --collect \
+  --setenv=PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  --setenv=PYTHONUNBUFFERED=1 \
+  --working-directory="$dir" \
+  /usr/bin/python3 -I "$dir/observer.py"

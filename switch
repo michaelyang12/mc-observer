@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+if [ $# -ne 1 ] || [ ! -f "personas/$1.md" ]; then
+  echo "usage: ./switch <persona>"
+  echo "available: $(ls personas | sed 's/\.md$//' | tr '\n' ' ')"
+  echo "current:   $(readlink persona.md 2>/dev/null | sed 's#personas/##; s/\.md$//')"
+  exit 1
+fi
+ln -sfn "personas/$1.md" persona.md
+echo "now: $(head -1 persona.md | sed 's/^# //')"
