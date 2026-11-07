@@ -469,15 +469,24 @@ class Observer:
         try:
             out = subprocess.run(
                 ["claude", "-p", "--model", MODEL, "--tools", "", "--strict-mcp-config", "--setting-sources", "",
-                 "--no-session-persistence", "--system-prompt", system, prompt],
+                 "--no-session-persistence", "--output-format", "json", "--system-prompt", system, prompt],
                 capture_output=True, text=True, timeout=60, env=env, cwd=HERE,
             )
         except subprocess.TimeoutExpired:
             log("model timeout")
             return None
-        m = re.search(r"\{.*\}", out.stdout, re.S)
+        try:
+            result = json.loads(out.stdout)
+        except json.JSONDecodeError:
+            log(f"unparseable cli output: {out.stdout[:200]!r} {out.stderr[:200]!r}")
+            return None
+        u = result.get("usage") or {}
+        log(f"usage in={u.get('input_tokens', 0)} cache_write={u.get('cache_creation_input_tokens', 0)} "
+            f"cache_read={u.get('cache_read_input_tokens', 0)} out={u.get('output_tokens', 0)} "
+            f"prompt_chars={len(prompt)} cost=${result.get('total_cost_usd', 0):.4f}")
+        m = re.search(r"\{.*\}", str(result.get("result", "")), re.S)
         if not m:
-            log(f"no json from model: {out.stdout[:200]!r} {out.stderr[:200]!r}")
+            log(f"no json from model: {str(result.get('result'))[:200]!r}")
             return None
         try:
             return json.loads(m.group(0))
