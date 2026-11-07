@@ -416,7 +416,7 @@ def wealth_summary(totals: dict[str, int], worn: list[str]) -> str:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS players (
-    name TEXT PRIMARY KEY, first_seen REAL, last_seen REAL, total_playtime_s REAL NOT NULL DEFAULT 0);
+    name TEXT PRIMARY KEY, first_seen REAL, last_seen REAL, total_playtime_s REAL NOT NULL DEFAULT 0, uuid TEXT);
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY, player TEXT NOT NULL, joined_at REAL NOT NULL, left_at REAL, summary TEXT);
 CREATE INDEX IF NOT EXISTS sessions_player ON sessions(player, joined_at);
@@ -523,6 +523,9 @@ class Memory:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        if "uuid" not in {r["name"] for r in self.q("PRAGMA table_info(players)")}:
+            self.x("ALTER TABLE players ADD COLUMN uuid TEXT")
+        self.x("CREATE UNIQUE INDEX IF NOT EXISTS players_uuid ON players(uuid)")
         if not self.one("SELECT 1 FROM meta WHERE key = 'imported_state'"):
             self.import_state(STATE_FILE)
 
@@ -634,6 +637,41 @@ class Memory:
         now = time.time()
         self.x("INSERT INTO players (name, first_seen, last_seen) VALUES (?, ?, ?) "
                "ON CONFLICT(name) DO UPDATE SET last_seen = excluded.last_seen", (player, now, now))
+
+    def identify(self, name: str, uuid: str) -> str | None:
+        """Tie a name to its account; returns the account's previous name if it was renamed."""
+        with self.tx() as db:
+            row = db.execute("SELECT name FROM players WHERE uuid = ?", (uuid,)).fetchone()
+            old = row["name"] if row else None
+            if old == name:
+                return None
+            holder = db.execute("SELECT uuid FROM players WHERE name = ?", (name,)).fetchone()
+            if holder and holder["uuid"]:
+                self.rename(db, name, f"{name}~{holder['uuid'][:8]}")
+            if old:
+                self.rename(db, old, name)
+                db.execute("INSERT OR REPLACE INTO facts (player, key, value, updated_at, source) VALUES (?, ?, ?, ?, 'code')",
+                           (name, "formerly known as", old.split("~")[0], time.time()))
+            now = time.time()
+            db.execute("INSERT INTO players (name, first_seen, last_seen, uuid) VALUES (?, ?, ?, ?) "
+                       "ON CONFLICT(name) DO UPDATE SET uuid = excluded.uuid", (name, now, now, uuid))
+        return old.split("~")[0] if old else None
+
+    @staticmethod
+    def rename(db: sqlite3.Connection, old: str, new: str) -> None:
+        dst = db.execute("SELECT * FROM players WHERE name = ?", (new,)).fetchone()
+        if dst:
+            db.execute("DELETE FROM players WHERE name = ?", (new,))
+            db.execute("UPDATE players SET first_seen = MIN(COALESCE(first_seen, ?1), ?1), last_seen = MAX(COALESCE(last_seen, ?2), ?2), "
+                       "total_playtime_s = total_playtime_s + ?3 WHERE name = ?4",
+                       (dst["first_seen"] or time.time(), dst["last_seen"] or 0, dst["total_playtime_s"], old))
+        db.execute("UPDATE players SET name = ? WHERE name = ?", (new, old))
+        for table, key in (("facts", "key"), ("relationships", "persona"), ("memory_players", "memory_id")):
+            db.execute(f"DELETE FROM {table} WHERE player = ? AND {key} IN (SELECT {key} FROM {table} WHERE player = ?)", (new, old))
+        for table in ("sessions", "events", "facts", "relationships", "opinion_changes", "memory_players", "actions"):
+            db.execute(f"UPDATE {table} SET player = ? WHERE player = ?", (new, old))
+        db.execute("UPDATE OR REPLACE cooldowns SET key = substr(key, 1, length(key) - ?) || ? WHERE substr(key, -?) = ?",
+                   (len(old), new, len(old) + 1, f":{old}"))
 
     def open_session(self, player: str) -> None:
         self.close_session(player)
@@ -878,8 +916,11 @@ class Observer:
         self.mem.add_event("bot_action", f"{p['name']} {text}", player, p["slug"], importance or ACTION_IMPORTANCE.get(kind, 2))
 
     def refresh_online(self) -> None:
-        names = re.findall(r"^\w+: (.*)$", rcon("list"), re.M)
-        self.online = {n.strip() for line in names for n in line.split(",") if PLAYER.match(n.strip())}
+        accounts = re.findall(r"\b(\w{3,16}) \(([0-9a-f-]{36})\)", rcon("minecraft:list uuids"))
+        for name, uuid in accounts:
+            if old := self.mem.identify(name, uuid):
+                log(f"{old} is now {name}: memory moved")
+        self.online = {name for name, _ in accounts}
 
     def tail(self) -> None:
         while True:

@@ -92,6 +92,10 @@ is its file slug (`personas/deborah.md` -> `deborah`). Spec: `../docs/superpower
 - Private to a persona: `relationships` (opinion -100..100, familiarity, impression, nickname),
   `opinion_changes` (delta + note), `memories` (moment/grudge/favor/promise/joke, linked to players through
   `memory_players`; no links = the persona's own experience).
+- Rows are keyed by player name; `players.uuid` ties a name to its Mojang account. `refresh_online()` reads
+  `minecraft:list uuids` (Essentials' `list` has no UUIDs) on start and every join/leave, and `identify()`
+  handles renames: the old name's rows in every table move to the new name, plus a `formerly known as` fact.
+  A name taken over by a different account is first parked as `name~<uuid8>`.
 - Writes: code logs events/actions. The reply JSON may carry `opinion` (delta clamped to -15..+15), `memory`
   and `fact` (<=2 each, players must be known, text capped). Open promises/grudges/favors: <=5 per persona per
   player (a sixth resolves the least important), auto-resolved after 30 days.
