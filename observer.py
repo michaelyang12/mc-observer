@@ -34,6 +34,15 @@ MAX_STACK = 32
 OBSERVE_EVERY = 45
 QUIET_AFTER = 360
 
+OPINION_RANGE = 100
+OPINION_STEP = 15
+MEMORY_KINDS = {"moment", "grudge", "favor", "promise", "joke"}
+OPEN_KINDS = {"grudge", "favor", "promise"}
+OPEN_CAP = 5
+OPEN_MAX_AGE = 30 * 86400
+FACT_CAP = 15
+ACTION_IMPORTANCE = {"smite": 4, "take": 4, "give": 3, "world": 3}
+
 FRIENDLY_MOBS = {"chicken", "pig", "cow", "sheep", "rabbit", "frog", "goat", "fox", "llama", "parrot", "cat"}
 HOSTILE_MOBS = {"zombie", "skeleton", "spider", "silverfish", "slime", "witch"}
 POTIONS = {
@@ -55,6 +64,7 @@ LINE = re.compile(r"^\[[\d:]+ INFO\]: (?:System chat: )?(.*)$")
 CHAT = re.compile(r"^<(\w{3,16})> (.*)$")
 PLAYER = re.compile(r"^\w{3,16}$")
 ITEM = re.compile(r"^(minecraft:)?[a-z0-9_]+$")
+FACT_KEY = re.compile(r"^[a-z][a-z0-9_ ]{0,23}$")
 ITEM_ENTRY = re.compile(r'id: "minecraft:([a-z0-9_]+)"(?:, count: (\d+))?')
 DENIED_ITEM = re.compile(
     r"netherite|elytra|totem|enchanted|spawn_egg|command_block|structure_|jigsaw|barrier|bedrock|"
@@ -84,10 +94,10 @@ You are an all-seeing presence on this server. You watch chat and game events an
 or act. Silence is fine: if nothing is worth reacting to, return "say": "" and no actions. React more to
 big moments (deaths, advancements, someone addressing you, dramatic observations) than to small talk.
 
-You have a memory of each player: an opinion score from -10 (despise) to +10 (adore) plus notes. After every
-event, update opinions of the players involved according to YOUR persona's values (what you like/dislike
-is defined in the persona, e.g. respect, wealth, bravery, poverty, deaths). Small deltas (-3..+3) with a
-short note when something meaningful happened. Let opinion shape tone, generosity, and punishment: favorites
+You have a memory of each player: your own opinion score from -100 (despise) to +100 (adore) plus notes. After
+every event, update opinions of the players involved according to YOUR persona's values (what you like/dislike
+is defined in the persona, e.g. respect, wealth, bravery, poverty, deaths). Deltas -15..+15 (most events
+-5..+5; save double digits for big moments) with a short note when something meaningful happened. Let opinion shape tone, generosity, and punishment: favorites
 get warmth and gifts, players you dislike get mockery, curses, and mobs.
 
 What you see about players (health, food, dimension, wealth summary, gear, deaths, kills, full inventory
@@ -111,7 +121,9 @@ Rules you must follow, whatever the persona says:
 
 Output ONLY a JSON object, no prose. Omit fields or use null for actions you don't take:
 {"say": "line or empty",
- "opinion": [{"player": "Name", "delta": -2, "note": "short reason"}],
+ "opinion": [{"player": "Name", "delta": -4, "note": "short reason"}],
+ "memory": [{"players": ["Name"], "kind": "moment|grudge|favor|promise|joke", "text": "...", "importance": 4}],
+ "fact": [{"player": "Name", "key": "base", "value": "near the spawn river"}],
  "give": [{"player": "Name", "item": "minecraft:cooked_beef", "count": 4}],
  "take": {"player": "Name", "item": "minecraft:dirt", "count": 32},
  "summon": {"player": "Name", "mob": "zombie", "count": 2},
@@ -218,6 +230,10 @@ def as_int(value, default: int = 0) -> int:
         return int(float(str(value).rstrip("fdbsL")))
     except ValueError:
         return default
+
+
+def clean(value, limit: int) -> str:
+    return " ".join(value.split())[:limit] if isinstance(value, str) else ""
 
 
 def persona() -> dict:
@@ -346,11 +362,11 @@ def classify(body: str, names) -> tuple[str, str | None, int]:
     if body.startswith("<"):
         return "bot_say", None, 1
     first = body.split(" ", 1)[0]
-    player = first if PLAYER.match(first) else None
     if "joined the game" in body:
-        return "join", player, 1
+        return "join", first if PLAYER.match(first) else None, 1
     if "left the game" in body:
-        return "leave", player, 1
+        return "leave", first if PLAYER.match(first) else None, 1
+    player = first if first in names else None
     if "has completed the challenge" in body:
         return "advancement", player, 4
     if "has made the advancement" in body or "has reached the goal" in body:
@@ -475,6 +491,75 @@ class Memory:
                 db.execute("INSERT INTO opinion_changes (persona, player, t, delta, note) VALUES (?, ?, ?, ?, ?)",
                            (persona, player, time.time(), delta, note))
 
+    def known(self, player: str) -> bool:
+        return self.one("SELECT 1 FROM players WHERE name = ?", (player,)) is not None
+
+    def seen(self, player: str) -> None:
+        now = time.time()
+        self.x("INSERT INTO players (name, first_seen, last_seen) VALUES (?, ?, ?) "
+               "ON CONFLICT(name) DO UPDATE SET last_seen = excluded.last_seen", (player, now, now))
+
+    def open_session(self, player: str) -> None:
+        self.close_session(player)
+        self.seen(player)
+        self.x("INSERT INTO sessions (player, joined_at) VALUES (?, ?)", (player, time.time()))
+
+    def close_session(self, player: str, at: float | None = None) -> sqlite3.Row | None:
+        row = self.one("SELECT * FROM sessions WHERE player = ? AND left_at IS NULL ORDER BY joined_at DESC LIMIT 1", (player,))
+        if not row:
+            return None
+        at = at or time.time()
+        with self.tx() as db:
+            db.execute("UPDATE sessions SET left_at = ? WHERE player = ? AND left_at IS NULL", (at, player))
+            db.execute("UPDATE players SET last_seen = MAX(COALESCE(last_seen, 0), ?), "
+                       "total_playtime_s = total_playtime_s + ? WHERE name = ?", (at, max(0.0, at - row["joined_at"]), player))
+        return self.one("SELECT * FROM sessions WHERE id = ?", (row["id"],))
+
+    def sync_sessions(self, online: set[str]) -> None:
+        for row in self.q("SELECT player, joined_at FROM sessions WHERE left_at IS NULL"):
+            if row["player"] not in online:
+                last = self.one("SELECT MAX(t) AS t FROM events WHERE player = ? AND t >= ?", (row["player"], row["joined_at"]))
+                self.close_session(row["player"], (last and last["t"]) or row["joined_at"])
+        for player in online:
+            if not self.one("SELECT 1 FROM sessions WHERE player = ? AND left_at IS NULL", (player,)):
+                self.open_session(player)
+
+    def first_death_in(self, player: str, dim: str) -> bool:
+        return self.one("SELECT 1 FROM events WHERE kind = 'death' AND player = ? AND dim = ?", (player, dim)) is None
+
+    def touch(self, persona: str, players) -> None:
+        with self.tx() as db:
+            for player in players:
+                db.execute("INSERT OR IGNORE INTO relationships (persona, player) VALUES (?, ?)", (persona, player))
+                db.execute("UPDATE relationships SET familiarity = familiarity + 1, last_interaction = ? "
+                           "WHERE persona = ? AND player = ?", (time.time(), persona, player))
+
+    def add_memory(self, persona: str, kind: str, text: str, importance: int, players) -> int:
+        with self.tx() as db:
+            mid = db.execute("INSERT INTO memories (persona, t, kind, text, importance, status) VALUES (?, ?, ?, ?, ?, ?)",
+                             (persona, time.time(), kind, text, importance, "open" if kind in OPEN_KINDS else None)).lastrowid
+            for player in players:
+                db.execute("INSERT OR IGNORE INTO memory_players (memory_id, player) VALUES (?, ?)", (mid, player))
+                if kind not in OPEN_KINDS:
+                    continue
+                rows = db.execute(
+                    "SELECT m.id FROM memories m JOIN memory_players mp ON mp.memory_id = m.id WHERE m.persona = ? "
+                    "AND mp.player = ? AND m.status = 'open' AND m.id != ? ORDER BY m.importance, m.t",
+                    (persona, player, mid)).fetchall()
+                for r in rows[:max(0, len(rows) + 1 - OPEN_CAP)]:
+                    db.execute("UPDATE memories SET status = 'resolved' WHERE id = ?", (r["id"],))
+        return mid
+
+    def expire_open(self) -> None:
+        self.x("UPDATE memories SET status = 'resolved' WHERE status = 'open' AND t < ?", (time.time() - OPEN_MAX_AGE,))
+
+    def set_fact(self, player: str, key: str, value: str, source: str) -> None:
+        with self.tx() as db:
+            db.execute("INSERT OR REPLACE INTO facts (player, key, value, updated_at, source) VALUES (?, ?, ?, ?, ?)",
+                       (player, key, value, time.time(), source))
+            db.execute("DELETE FROM facts WHERE player = ? AND key NOT IN "
+                       "(SELECT key FROM facts WHERE player = ? ORDER BY updated_at DESC LIMIT ?)", (player, player, FACT_CAP))
+
     def opinion_notes(self, persona: str, player: str, n: int) -> list[sqlite3.Row]:
         return self.q("SELECT * FROM (SELECT * FROM opinion_changes WHERE persona = ? AND player = ? "
                       "ORDER BY t DESC LIMIT ?) ORDER BY t", (persona, player, n))
@@ -501,7 +586,24 @@ class Observer:
 
     def record(self, body: str, slug: str) -> int:
         kind, player, importance = classify(body, self.online)
-        return self.mem.add_event(kind, body, player, slug, importance)
+        dim = None
+        if kind == "join" and player:
+            self.mem.open_session(player)
+        elif kind == "leave" and player:
+            self.mem.close_session(player)
+        elif kind == "chat":
+            self.mem.seen(player)
+        if kind == "death" and player:
+            dim = (self.vitals.get(player) or {}).get("dim") or None
+            if dim and self.mem.first_death_in(player, dim):
+                importance = 3
+        return self.mem.add_event(kind, body, player, slug, importance, dim)
+
+    def acted(self, kind: str, player: str | None, detail: dict, text: str, diamonds: int = 0,
+              importance: int | None = None) -> None:
+        p = persona()
+        self.mem.add_action(p["slug"], player, kind, detail, diamonds)
+        self.mem.add_event("bot_action", f"{p['name']} {text}", player, p["slug"], importance or ACTION_IMPORTANCE.get(kind, 2))
 
     def refresh_online(self) -> None:
         names = re.findall(r"^\w+: (.*)$", rcon("list"), re.M)
@@ -633,6 +735,7 @@ class Observer:
             "\nRecent server log (oldest first, your own lines included):\n" + "\n".join(self.mem.recent_lines(25)) +
             "\n\nNEW (react to these, or stay silent):\n" + "\n".join(batch)
         )
+        self.mem.touch(p["slug"], involved)
         t0 = time.time()
         action = self.ask_model(p, prompt)
         log(f"model {time.time() - t0:.1f}s -> {action}")
@@ -672,7 +775,8 @@ class Observer:
 
     def execute(self, action: dict, speakers: set[str]) -> None:
         handlers = [
-            ("opinion", self.update_opinions), ("take", lambda a: self.take(a, speakers)), ("give", self.give_all),
+            ("opinion", self.update_opinions), ("memory", self.save_memories), ("fact", self.save_facts),
+            ("take", lambda a: self.take(a, speakers)), ("give", self.give_all),
             ("summon", self.summon), ("potion", self.potion), ("title", self.title), ("smite", self.smite),
             ("effect", self.effect), ("world", self.world),
         ]
@@ -700,11 +804,35 @@ class Observer:
     def update_opinions(self, changes) -> None:
         for c in changes if isinstance(changes, list) else []:
             player = c.get("player") if isinstance(c, dict) else None
-            if not isinstance(player, str) or not PLAYER.match(player):
+            if not isinstance(player, str) or not PLAYER.match(player) or not self.mem.known(player):
                 continue
-            delta = max(-3, min(as_int(c.get("delta"), 0), 3))
-            note = " ".join(str(c.get("note", "")).split())[:80]
-            self.mem.change_opinion(persona()["slug"], player, delta, -10, 10, note)
+            delta = max(-OPINION_STEP, min(as_int(c.get("delta"), 0), OPINION_STEP))
+            note = clean(c.get("note"), 80)
+            if delta or note:
+                self.mem.change_opinion(persona()["slug"], player, delta, -OPINION_RANGE, OPINION_RANGE, note)
+
+    def save_memories(self, items) -> None:
+        for m in (items if isinstance(items, list) else [items])[:2]:
+            if not isinstance(m, dict) or m.get("kind") not in MEMORY_KINDS:
+                continue
+            text = clean(m.get("text"), 150)
+            players = m.get("players") or []
+            if not text or not isinstance(players, list):
+                continue
+            names = {n for n in players if isinstance(n, str) and PLAYER.match(n) and self.mem.known(n)}
+            if len(names) != len(players):
+                log(f"memory refused, unknown players: {players}")
+                continue
+            importance = max(1, min(as_int(m.get("importance"), 3), 10))
+            self.mem.add_memory(persona()["slug"], m["kind"], text, importance, sorted(names))
+
+    def save_facts(self, items) -> None:
+        for f in (items if isinstance(items, list) else [items])[:2]:
+            if not isinstance(f, dict):
+                continue
+            player, key, value = f.get("player"), clean(f.get("key"), 24).lower(), clean(f.get("value"), 100)
+            if isinstance(player, str) and PLAYER.match(player) and self.mem.known(player) and FACT_KEY.match(key) and value:
+                self.mem.set_fact(player, key, value, "model")
 
     def give_all(self, gifts) -> None:
         for g in (gifts if isinstance(gifts, list) else [gifts])[:3]:
@@ -726,7 +854,7 @@ class Observer:
         result = rcon(f"give {player} minecraft:{bare} {count}")
         log(result)
         if result.startswith(("Gave", "Giving")):
-            self.mem.add_action(persona()["slug"], player, "give", {"item": bare, "count": count}, diamonds)
+            self.acted("give", player, {"item": bare, "count": count}, f"gave {player} {count} {bare}", diamonds)
 
     def take(self, t: dict, speakers: set[str]) -> None:
         player, item = self.target(t), str(t.get("item", ""))
@@ -740,7 +868,7 @@ class Observer:
             log(f"take refused for item {bare}")
             return
         log(rcon(f"clear {player} minecraft:{bare} {count}"))
-        self.mem.add_action(persona()["slug"], player, "take", {"item": bare, "count": count})
+        self.acted("take", player, {"item": bare, "count": count}, f"took {count} {bare} from {player}")
 
     def summon(self, s: dict) -> None:
         player = self.target(s)
@@ -753,14 +881,18 @@ class Observer:
                 return
             rcon(f"execute at {player} rotated as {player} run summon minecraft:creeper ^ ^ ^-2 {{ExplosionRadius:1b}}")
             self.used("creeper")
+            self.acted("summon", player, {"mob": mob, "count": 1}, f"summoned a creeper behind {player}", importance=4)
         elif mob in HOSTILE_MOBS or mob in FRIENDLY_MOBS:
             key, cooldown, cap = ("hostile", HOSTILE_COOLDOWN, 3) if mob in HOSTILE_MOBS else ("friendly", FRIENDLY_COOLDOWN, 5)
             if not self.ready(key, cooldown):
                 log(f"{key} summon on cooldown")
                 return
-            for _ in range(max(1, min(as_int(s.get("count"), 1), cap))):
+            count = max(1, min(as_int(s.get("count"), 1), cap))
+            for _ in range(count):
                 rcon(f"execute at {player} run summon minecraft:{mob} ~{random.randint(-3, 3)} ~ ~{random.randint(-3, 3)}")
             self.used(key)
+            self.acted("summon", player, {"mob": mob, "count": count}, f"summoned {count} {mob} at {player}",
+                       importance=3 if key == "hostile" else 2)
         else:
             log(f"denied summon {mob}")
             return
@@ -782,6 +914,8 @@ class Observer:
             rcon(f"effect give {player} minecraft:slow_falling {seconds + 15} 0 true")
         log(rcon(f"effect give {player} minecraft:{effect} {seconds} {level}"))
         self.used(key)
+        self.acted("potion", player, {"effect": effect, "seconds": seconds, "level": level + 1},
+                   f"gave {player} {effect} for {seconds}s")
 
     def title(self, t: dict) -> None:
         player = self.target(t)
@@ -791,11 +925,13 @@ class Observer:
         color = persona()["color"][0]
         rcon(f"title {player} title " + json.dumps({"text": text, "color": color, "bold": True}))
         self.used("title")
+        self.acted("title", player, {"text": text}, f"put a title on {player}'s screen: {text}")
 
     def smite(self, player) -> None:
         if isinstance(player, str) and player in self.online and self.ready("smite", SMITE_COOLDOWN):
             rcon(f"lightning {player}")
             self.used("smite")
+            self.acted("smite", player, {}, f"smote {player} with lightning")
 
     def effect(self, e: dict) -> None:
         player, kind = self.target(e), e.get("kind")
@@ -811,8 +947,11 @@ class Observer:
             "fanfare": [f"execute as {player} at @s run playsound minecraft:ui.toast.challenge_complete master @s ~ ~ ~ 1 1",
                         f"execute at {player} run particle minecraft:totem_of_undying ~ ~1 ~ 0.5 1 0.5 0.3 60"],
         }
-        for cmd in presets.get(kind, []):
+        if kind not in presets:
+            return
+        for cmd in presets[kind]:
             rcon(cmd)
+        self.acted("effect", player, {"kind": kind}, f"played a {kind} effect on {player}", importance=1)
 
     def world(self, w: dict) -> None:
         when = w.get("time") if w.get("time") in TIMES else None
@@ -824,6 +963,8 @@ class Observer:
         if weather:
             log(rcon(f"minecraft:weather {weather}"))
         self.used("world")
+        self.acted("world", None, {"time": when, "weather": weather},
+                   "changed the world: " + ", ".join(x for x in (when, weather) if x))
 
     def setup_stats(self) -> None:
         for name, criterion in STATS.items():
@@ -832,6 +973,8 @@ class Observer:
     def run(self) -> None:
         self.setup_stats()
         self.refresh_online()
+        self.mem.sync_sessions(self.online)
+        self.mem.expire_open()
         log(f"online at start: {sorted(self.online)}; persona {persona()['name']}")
         threading.Thread(target=self.tail, daemon=True).start()
         threading.Thread(target=self.observe, daemon=True).start()
