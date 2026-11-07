@@ -16,9 +16,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-STATE_FILE = HERE / "state.json"
-MEMORY_DB = HERE / "memory.db"
-PERSONA_FILE = HERE / "persona.md"
+INSTANCE = HERE / "instances" / os.environ.get("OBSERVER_INSTANCE", "main")
+STATE_FILE = INSTANCE / "state.json"
+MEMORY_DB = INSTANCE / "memory.db"
+PERSONA_FILE = INSTANCE / "persona.md"
 CONTAINER = os.environ.get("OBSERVER_CONTAINER", "minecraft")
 MODEL = os.environ.get("OBSERVER_MODEL", "sonnet")
 

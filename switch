@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-if [ $# -ne 1 ] || [ ! -f "personas/$1.md" ]; then
-  echo "usage: ./switch <persona>"
-  echo "available: $(ls personas | sed 's/\.md$//' | tr '\n' ' ')"
-  echo "current:   $(readlink persona.md 2>/dev/null | sed 's#personas/##; s/\.md$//')"
+if [ $# -eq 1 ]; then set -- main "$1"; fi
+if [ $# -ne 2 ] || [ ! -d "instances/$1" ] || [ ! -f "personas/$2.md" ]; then
+  echo "usage: ./switch [instance] <persona>    (instance defaults to main)"
+  echo "personas:  $(ls personas | sed 's/\.md$//' | tr '\n' ' ')"
+  for i in instances/*/; do
+    [ -d "$i" ] && echo "instance:  $(basename "$i") -> $(readlink "$i/persona.md" 2>/dev/null | sed 's#.*/##; s/\.md$//')"
+  done
   exit 1
 fi
-ln -sfn "personas/$1.md" persona.md
-echo "now: $(head -1 persona.md | sed 's/^# //')"
+ln -sfn "../../personas/$2.md" "instances/$1/persona.md"
+echo "$1 now: $(head -1 "instances/$1/persona.md" | sed 's/^# //')"

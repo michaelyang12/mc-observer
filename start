@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 dir="$(cd "$(dirname "$0")" && pwd)"
-[ -e "$dir/persona.md" ] || ln -s personas/pirate.md "$dir/persona.md"
-systemctl --user stop mc-observer mc-narrator darren-bot 2>/dev/null || true
-systemctl --user reset-failed mc-observer 2>/dev/null || true
-systemd-run --user --unit=mc-observer --collect \
+name="${1:-main}"
+inst="$dir/instances/$name"
+if [ ! -f "$inst/env" ]; then
+  echo "no instance '$name': create $inst/env containing OBSERVER_CONTAINER=<container name>"
+  echo "instances: $(ls "$dir/instances" 2>/dev/null | tr '\n' ' ')"
+  exit 1
+fi
+[ -e "$inst/persona.md" ] || ln -s ../../personas/pirate.md "$inst/persona.md"
+unit="mc-observer-$name"
+systemctl --user stop "$unit" 2>/dev/null || true
+systemctl --user reset-failed "$unit" 2>/dev/null || true
+systemd-run --user --unit="$unit" --collect \
   --setenv=PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
   --setenv=PYTHONUNBUFFERED=1 \
+  --setenv=OBSERVER_INSTANCE="$name" \
+  --property=EnvironmentFile="$inst/env" \
   --working-directory="$dir" \
   /usr/bin/python3 -I "$dir/observer.py"

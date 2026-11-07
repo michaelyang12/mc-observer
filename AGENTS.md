@@ -4,26 +4,36 @@ mc-observer: an all-seeing AI character in Minecraft chat (Cap'n Claude, Grimbol
 ...). It watches chat and game events, remembers players per persona (SQLite), and acts on gameplay (gifts, mobs,
 potions, smites, time/weather). Plain Python 3 stdlib, no dependencies; runs on the host as a systemd user unit.
 
+One checkout serves any number of servers. Each server is an instance: `instances/<name>/` holds its config,
+memory and active persona, and runs as its own unit `mc-observer-<name>`. Today there is one, `main`, for the
+Paper server in `~/Source/mc-server` (its `AGENTS.md` has the server rules: never restart it without asking).
+
 ## Commands
 
+`<i>` is the instance name; `./start` and `./switch` default to `main`.
+
 ```sh
-./switch                 # list personas, show the active one
-./switch deborah         # change persona; live on the next reply, no restart
-./start                  # (re)start the systemd unit `mc-observer` from this directory
-systemctl --user stop mc-observer
-journalctl --user -u mc-observer -f     # each model call with timing + JSON, plus refusals
-python3 -I -m py_compile observer.py    # syntax check
-python3 -I -c "import sqlite3; d = sqlite3.connect('file:memory.db?mode=ro', uri=True)
+./switch                 # list personas and each instance's active one
+./switch deborah         # change main's persona; live on the next reply, no restart
+./switch <i> deborah     # same for another instance
+./start [<i>]            # (re)start the unit mc-observer-<i>
+systemctl --user stop mc-observer-<i>
+journalctl --user -u mc-observer-main -f     # each model call with timing + JSON, plus refusals
+python3 -I -m py_compile observer.py         # syntax check
+python3 -I -c "import sqlite3; d = sqlite3.connect('file:instances/main/memory.db?mode=ro', uri=True)
 [print(tuple(r)) for r in d.execute('SELECT * FROM relationships')]"   # inspect memory (no sqlite3 CLI here)
-journalctl --user -u mc-observer | grep usage   # token use per call; call=reply|review
+journalctl --user -u mc-observer-main | grep usage   # token use per call; call=reply|review
 ```
 
-After editing `observer.py`: `python3 -I -m py_compile observer.py && ./start`, then watch the journal.
-Persona edits need no restart. The unit is transient (`systemd-run`) and does not survive a host reboot; rerun
-`./start`. Lines logged during the ~1s restart are missed.
+After editing `observer.py`: `python3 -I -m py_compile observer.py`, then `./start <i>` for every running
+instance, and watch the journal. Persona edits need no restart. Units are transient (`systemd-run`) and don't
+survive a host reboot; rerun `./start`. Lines logged during the ~1s restart are missed.
 
-Dry-run a persona without touching the server (prints the model's JSON, executes nothing; uses `memory.db`
-in this directory, creating it if missing):
+New instance: `mkdir instances/<i>`, write `instances/<i>/env` with `OBSERVER_CONTAINER=<container>` (optional
+`OBSERVER_MODEL=sonnet`), then `./start <i>`. It starts with an empty memory and the pirate persona.
+
+Dry-run a persona without touching the server (prints the model's JSON, executes nothing; reads and writes
+`instances/main/memory.db`):
 ```sh
 python3 -I -c "import sys; sys.path.insert(0,'.'); import observer as o
 o.PERSONA_FILE = o.HERE/'personas/grimbold.md'; b = o.Observer(); b.refresh_online()
@@ -52,15 +62,28 @@ vitals poller (every 45s) ----> queue -> log to memory.db -> worth a model call?
   key in the environment isn't the user's to spend.
 - Don't move this back into a Claude Code session with Monitor watchers: notifications arrive late and batched.
 
+## What a server needs
+
+- A Docker container from `itzg/minecraft-server` (RCON on, password in `/data/.rcon-cli.env`), on this host.
+  Chat and events come from `docker logs`.
+- Paper or Spigot log format. A chat plugin that rewrites console chat lines can break parsing.
+- EssentialsX for two abilities: `smite` (`lightning <p>`) and `world` (`time set <x> world`, Essentials'
+  syntax). Without it those commands fail and are logged; everything else is vanilla.
+- Online mode (Mojang UUIDs), so renames are detected.
+
 ## Layout
 
 | Path | What |
 |---|---|
 | `observer.py` | The bot. Limits/cooldowns at the top, `RULES` prompt, `execute()` and one handler per action |
 | `personas/<name>.md` | One character per file, read on every call |
-| `persona.md` | Symlink to the active persona (gitignored) |
-| `memory.db` | SQLite memory: events, sessions, per-persona relationships and memories, facts, actions, cooldowns (gitignored) |
-| `state.json` | Pre-SQLite memory. Imported once into `memory.db` on first start, then never read again (gitignored) |
+| `start`, `switch` | Run an instance; change an instance's persona |
+| `instances/<i>/` | Per-server state, gitignored, not backed up by git |
+| `instances/<i>/env` | systemd environment file: `OBSERVER_CONTAINER`, optional `OBSERVER_MODEL` |
+| `instances/<i>/persona.md` | Symlink to the active persona (`../../personas/<name>.md`) |
+| `instances/<i>/memory.db` | SQLite memory: events, sessions, per-persona relationships and memories, facts, actions, cooldowns |
+| `instances/<i>/state.json` | Pre-SQLite memory (main only). Imported once into `memory.db`, then never read again |
+| `docs/` | Design docs (`2026-11-07-observer-memory-design.md`; its `observer/` paths predate the move) |
 
 ## Personas
 
@@ -84,7 +107,7 @@ inverted values are what make characters distinct. No sexual content: the chat i
 ## Memory
 
 `memory.db` (WAL, one connection behind an `RLock` in `Memory`; standard-library `sqlite3` with FTS5). A persona
-is its file slug (`personas/deborah.md` -> `deborah`). Spec: `../docs/superpowers/specs/2026-11-07-observer-memory-design.md`.
+is its file slug (`personas/deborah.md` -> `deborah`). Spec: `docs/2026-11-07-observer-memory-design.md`.
 
 - Shared by all personas: `events` (every chat line, game event, observation, bot line and action, with an
   importance 1..10 set by code; never deleted), `sessions` (+ neutral summary from the logoff review),
@@ -150,7 +173,7 @@ not available even here (user's call): server stop/reload, op/deop, whitelist, b
 
 ## Don'ts
 
-- Don't restart or redeploy the Minecraft server as part of observer work (see `../AGENTS.md`).
+- Don't restart or redeploy a Minecraft server as part of observer work (see `~/Source/mc-server/AGENTS.md`).
 - Gamemode, kick, kill, teleport, xp, enchant and difficulty exist only for unrestricted personas. Gamerules,
   op/deop, ban/whitelist, server control and terrain editing are not abilities for anyone; add only if the user
   explicitly asks, with the same validate-in-code pattern.
